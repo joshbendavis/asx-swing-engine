@@ -20,8 +20,11 @@ Composite score (0–100), ranked descending:
 """
 
 import io
+import os
+import sys
 import time
 import warnings
+import contextlib
 
 import numpy as np
 import pandas as pd
@@ -30,6 +33,18 @@ import yfinance as yf
 
 warnings.filterwarnings("ignore")
 
+
+@contextlib.contextmanager
+def _suppress_yf_noise():
+    """Suppress yfinance's delisted/failed-download stderr chatter."""
+    with open(os.devnull, "w") as devnull:
+        old_stderr = sys.stderr
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stderr = old_stderr
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -37,6 +52,7 @@ BENCHMARK          = "^AXJO"
 HISTORY_PERIOD     = "1y"         # ~252 trading days — enough for 200 EMA
 
 MIN_PRICE          = 0.50
+MAX_PRICE          = 50.0         # mega-caps swing trade poorly (backtest confirmed)
 MIN_AVG_VOLUME     = 200_000
 MIN_MARKET_CAP     = 100_000_000  # AUD
 
@@ -48,7 +64,8 @@ RSI_MAX            = 65
 MAX_EMA50_DIST_PCT = 10.0         # max % a stock can be above its 50 EMA
 
 ATR_PERIOD         = 14
-ATR_SWEET_MIN      = 1.5          # below: too quiet
+MIN_ATR_PCT        = 3.0          # hard floor — backtest shows edge only above 3%
+ATR_SWEET_MIN      = 3.0          # align scoring sweet spot with hard floor
 ATR_SWEET_MAX      = 4.0          # above: too volatile
 ATR_SCORE_ZERO     = 8.0          # ATR% at which score hits 0 on the high side
 
@@ -147,31 +164,34 @@ def percentile_rank(series: pd.Series) -> pd.Series:
 
 def fetch_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
     """Download OHLCV for a batch of tickers; return {ticker: DataFrame}."""
-    raw = yf.download(
-        tickers,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+    with _suppress_yf_noise():
+        raw = yf.download(
+            tickers,
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
 
     result: dict[str, pd.DataFrame] = {}
 
-    # Single-ticker download returns flat columns, not MultiIndex
-    if len(tickers) == 1:
-        if not raw.empty:
-            result[tickers[0]] = raw
+    if raw.empty:
         return result
 
-    for ticker in tickers:
-        try:
-            df = raw[ticker].dropna(how="all")
-            if not df.empty:
-                result[ticker] = df
-        except KeyError:
-            pass
+    if isinstance(raw.columns, pd.MultiIndex):
+        # yfinance 1.x: columns are (field, ticker) when group_by is not set
+        # level=1 selects by ticker name across all fields
+        available = raw.columns.get_level_values(1).unique()
+        for ticker in tickers:
+            if ticker in available:
+                df = raw.xs(ticker, axis=1, level=1).dropna(how="all")
+                if not df.empty:
+                    result[ticker] = df
+    else:
+        # Flat columns — single ticker
+        if len(tickers) == 1:
+            result[tickers[0]] = raw.dropna(how="all")
 
     return result
 
@@ -200,9 +220,11 @@ def run_screener() -> pd.DataFrame:
 
     # 2 — Benchmark (XJO) — one download, used for all RS calcs
     print(f"Downloading benchmark ({BENCHMARK}) …")
-    xjo_raw   = yf.download(BENCHMARK, period=HISTORY_PERIOD, interval="1d",
-                            auto_adjust=True, progress=False)
-    xjo_close = xjo_raw["Close"].dropna()
+    with _suppress_yf_noise():
+        xjo_raw = yf.download(BENCHMARK, period=HISTORY_PERIOD, interval="1d",
+                              auto_adjust=True, progress=False)
+    _xjo_close = xjo_raw["Close"]
+    xjo_close = (_xjo_close.iloc[:, 0] if isinstance(_xjo_close, pd.DataFrame) else _xjo_close).dropna()
     if len(xjo_close) < RS_PERIOD + 1:
         raise RuntimeError("Not enough benchmark history. Check connection / yfinance.")
     xjo_63d_return = float(xjo_close.iloc[-1] / xjo_close.iloc[-RS_PERIOD - 1] - 1) * 100
@@ -259,18 +281,26 @@ def run_screener() -> pd.DataFrame:
         if np.isnan(rsi) or not (RSI_MIN <= rsi <= RSI_MAX):
             continue
 
-        # ---- Raw scoring metrics ----
+        # ---- New hard filters (data-driven from backtest) ----
+        if last_price > MAX_PRICE:
+            continue
+
+        atr     = calc_atr(high, low, close, ATR_PERIOD)
+        atr_pct = round(atr / last_price * 100, 2) if not np.isnan(atr) else np.nan
+        if np.isnan(atr_pct) or atr_pct < MIN_ATR_PCT:
+            continue
+
         rs_vs_xjo = np.nan
         if len(close) >= RS_PERIOD + 1:
             stock_63d = (close.iloc[-1] / close.iloc[-RS_PERIOD - 1] - 1) * 100
             rs_vs_xjo = round(float(stock_63d) - xjo_63d_return, 2)
+        if np.isnan(rs_vs_xjo) or rs_vs_xjo <= 0:
+            continue
 
+        # ---- Raw scoring metrics ----
         momentum = np.nan
         if len(close) >= MOMENTUM_PERIOD + 1:
             momentum = round(float((close.iloc[-1] / close.iloc[-MOMENTUM_PERIOD - 1] - 1) * 100), 2)
-
-        atr     = calc_atr(high, low, close, ATR_PERIOD)
-        atr_pct = round(atr / last_price * 100, 2) if not np.isnan(atr) else np.nan
 
         avg_vol_5  = float(volume.tail(VOL_SHORT).mean())
         vol_ratio  = round(avg_vol_5 / avg_vol_20, 2) if avg_vol_20 > 0 else np.nan
