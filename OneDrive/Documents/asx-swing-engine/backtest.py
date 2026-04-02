@@ -658,21 +658,21 @@ def print_results(metrics):
         ("Total return",       f"{m.get('pct_return', 0):+.1f}%"),
         ("Total P&L",          f"${m.get('total_pnl_aud', 0):,.2f}"),
         ("",                   ""),
-        ("Total trades",       str(m.get("total_trades", "—"))),
-        ("Win rate",           f"{m.get('win_rate_pct','—')}%"),
-        ("  Targets hit",      str(m.get("wins","—"))),
-        ("  Stops hit",        str(m.get("losses","—"))),
-        ("  Time stops",       str(m.get("time_stops","—"))),
+        ("Total trades",       str(m.get("total_trades", "n/a"))),
+        ("Win rate",           f"{m.get('win_rate_pct','n/a')}%"),
+        ("  Targets hit",      str(m.get("wins","n/a"))),
+        ("  Stops hit",        str(m.get("losses","n/a"))),
+        ("  Time stops",       str(m.get("time_stops","n/a"))),
         ("",                   ""),
-        ("Profit factor",      str(m.get("profit_factor","—"))),
-        ("Avg R / trade",      str(m.get("avg_r","—"))),
+        ("Profit factor",      str(m.get("profit_factor","n/a"))),
+        ("Avg R / trade",      str(m.get("avg_r","n/a"))),
         ("Expectancy / trade", f"${m.get('expectancy_aud', 0):,.2f}"),
-        ("Avg hold (days)",    str(m.get("avg_hold_days","—"))),
+        ("Avg hold (days)",    str(m.get("avg_hold_days","n/a"))),
         ("",                   ""),
         ("Max drawdown $",     f"${m.get('max_drawdown_aud', 0):,.2f}"),
-        ("Max drawdown %",     f"{m.get('max_drawdown_pct','—')}%"),
-        ("Max consec. losses", str(m.get("max_consec_losses","—"))),
-        ("Sharpe (annualised)",str(m.get("sharpe","—"))),
+        ("Max drawdown %",     f"{m.get('max_drawdown_pct','n/a')}%"),
+        ("Max consec. losses", str(m.get("max_consec_losses","n/a"))),
+        ("Sharpe (annualised)",str(m.get("sharpe","n/a"))),
         ("",                   ""),
         ("Best trade",         f"${m.get('best_trade_aud', 0):,.2f}"),
         ("Worst trade",        f"${m.get('worst_trade_aud', 0):,.2f}"),
@@ -964,7 +964,7 @@ def _comparison_table(results):
 
     sep = "=" * (met_w + col_w * len(labels) + 4)
     print(f"\n{sep}")
-    print(f"  RS SELECTION + DYNAMIC SIGNALS — 4-SCENARIO COMPARISON  ({date.today()})")
+    print(f"  RS SELECTION + DYNAMIC SIGNALS - 4-SCENARIO COMPARISON  ({date.today()})")
     print(sep)
 
     # header
@@ -1123,7 +1123,7 @@ def main():
         print(f"  {m['total_trades']} trades  |  "
               f"win {m['win_rate_pct']}%  |  "
               f"PF {m['profit_factor']}  |  "
-              f"return {m.get('pct_return', '—')}%")
+              f"return {m.get('pct_return', 'n/a')}%")
 
         # Save trade log + chart per scenario
         slug = label.lower().replace(" ", "_").replace("(","").replace(")","").replace("%","pct").replace(":","")[:40]

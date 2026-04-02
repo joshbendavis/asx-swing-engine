@@ -88,7 +88,7 @@ ASX_CSV_URL  = "https://www.asx.com.au/asx/research/ASXListedCompanies.csv"
 
 def fetch_asx_universe() -> list[str]:
     """Download ASX listed companies CSV and return ticker list (e.g. 'BHP.AX')."""
-    print("Fetching ASX universe …")
+    print("Fetching ASX universe ...")
     resp = requests.get(ASX_CSV_URL, timeout=30)
     resp.raise_for_status()
 
@@ -219,7 +219,7 @@ def run_screener() -> pd.DataFrame:
     tickers = fetch_asx_universe()
 
     # 2 — Benchmark (XJO) — one download, used for all RS calcs
-    print(f"Downloading benchmark ({BENCHMARK}) …")
+    print(f"Downloading benchmark ({BENCHMARK}) ...")
     with _suppress_yf_noise():
         xjo_raw = yf.download(BENCHMARK, period=HISTORY_PERIOD, interval="1d",
                               auto_adjust=True, progress=False)
@@ -230,13 +230,13 @@ def run_screener() -> pd.DataFrame:
     xjo_63d_return = float(xjo_close.iloc[-1] / xjo_close.iloc[-RS_PERIOD - 1] - 1) * 100
 
     # 3 — Download OHLCV in batches
-    print(f"Downloading OHLCV for {len(tickers)} tickers …")
+    print(f"Downloading OHLCV for {len(tickers)} tickers ...")
     price_data: dict[str, pd.DataFrame] = {}
     batches = [tickers[i: i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
 
     for idx, batch in enumerate(batches, 1):
         if idx % 10 == 0 or idx == len(batches):
-            print(f"  Batch {idx}/{len(batches)} …")
+            print(f"  Batch {idx}/{len(batches)} ...")
         price_data.update(fetch_batch(batch, HISTORY_PERIOD))
         if idx < len(batches):
             time.sleep(BATCH_DELAY)
@@ -319,7 +319,7 @@ def run_screener() -> pd.DataFrame:
             "vol_ratio":     vol_ratio,
         })
 
-    print(f"  {len(candidates)} passed technical filters. Fetching market caps …")
+    print(f"  {len(candidates)} passed technical filters. Fetching market caps ...")
 
     # 5 — Market cap filter (slow: one API call per candidate)
     passing: list[dict] = []
@@ -380,7 +380,7 @@ if __name__ == "__main__":
     if results.empty:
         print("No results.")
     else:
-        print(f"\n=== ASX Swing Universe — {len(results)} stocks | ranked by composite score ===")
+        print(f"\n=== ASX Swing Universe - {len(results)} stocks | ranked by composite score ===")
         print(results.to_string())
         results.to_csv("results/screener_output.csv")
-        print("\nSaved → results/screener_output.csv")
+        print("\nSaved -> results/screener_output.csv")

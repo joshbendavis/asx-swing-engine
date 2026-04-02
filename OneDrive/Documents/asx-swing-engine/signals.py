@@ -334,7 +334,7 @@ if __name__ == "__main__":
     pd.set_option("display.width",       200)
     pd.set_option("display.float_format", "{:.3f}".format)
 
-    print(f"\n=== ASX Swing Engine — Signal Scanner | {date.today()} ===\n")
+    print(f"\n=== ASX Swing Engine - Signal Scanner | {date.today()} ===\n")
 
     results = run_signals()
 

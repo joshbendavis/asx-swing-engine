@@ -92,7 +92,7 @@ def generate_charts(
 
     for _, row in top.iterrows():
         ticker = row["ticker"]
-        print(f"  Charting {ticker} …")
+        print(f"  Charting {ticker} ...")
 
         try:
             raw = yf.download(
@@ -203,7 +203,7 @@ def generate_charts(
             plt.close(fig)
 
             paths.append((ticker, os.path.abspath(out_path)))
-            print(f"    Saved → {out_path}")
+            print(f"    Saved -> {out_path}")
 
         except Exception as exc:
             print(f"    Chart failed for {ticker}: {exc}")

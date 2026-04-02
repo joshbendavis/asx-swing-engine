@@ -189,7 +189,7 @@ def send_email(
     """
     run_date = datetime.today().strftime("%A %d %B %Y")
     subject  = (
-        f"ASX Swing Engine — {datetime.today().strftime('%d %b %Y')}"
+        f"ASX Swing Engine - {datetime.today().strftime('%d %b %Y')}"
         f" | #{1} {results_df.iloc[0]['ticker'].replace('.AX','')} "
         f"Score {results_df.iloc[0]['composite_score']:.0f}"
     )
@@ -221,14 +221,14 @@ def send_email(
             )
             msg.attach(img)
         except FileNotFoundError:
-            print(f"  Warning: chart file not found — {filepath}")
+            print(f"  Warning: chart file not found - {filepath}")
 
     # Send
-    print(f"Connecting to {smtp_host}:{smtp_port} …")
+    print(f"Connecting to {smtp_host}:{smtp_port} ...")
     with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
         server.ehlo()
         server.starttls()
         server.login(from_addr, password)
         server.sendmail(from_addr, [to_addr], msg.as_string())
 
-    print(f"✓ Email sent → {to_addr}")
+    print(f"OK Email sent -> {to_addr}")
