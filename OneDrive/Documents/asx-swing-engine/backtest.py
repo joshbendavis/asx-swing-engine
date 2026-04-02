@@ -182,6 +182,17 @@ def compute_indicators(df, xjo_close=None, xjo_uptrend=None):
         d["xjo_uptrend"] = xjo_uptrend.reindex(d.index, method="ffill").fillna(False)
     else:
         d["xjo_uptrend"] = True   # default: always on (backwards-compat)
+    # ── Entry trigger signals (for dynamic signal threshold) ──────────────────
+    # T1: RSI bounce — yesterday RSI in 40-55, today RSI > yesterday
+    rsi_prev     = d["rsi"].shift(1)
+    t_rsi        = (rsi_prev >= 40) & (rsi_prev <= 55) & (d["rsi"] > rsi_prev)
+    # T2: MACD bullish cross — MACD line crosses above signal line
+    macd_line    = _ema(d["Close"], 12) - _ema(d["Close"], 26)
+    macd_sig     = _ema(macd_line, 9)
+    t_macd       = (macd_line.shift(1) < macd_sig.shift(1)) & (macd_line > macd_sig)
+    # T3: Volume breakout — today volume >= 1.5x 20-day average
+    t_vol        = d["Volume"] >= 1.5 * d["avg_vol"]
+    d["trigger_count"] = t_rsi.astype(int) + t_macd.astype(int) + t_vol.astype(int)
     return d
 
 
@@ -240,13 +251,24 @@ def _xjo_uptrend_series(xjo_close, regime):
     raise ValueError(f"Unknown regime: {regime!r}")
 
 
-def run_portfolio(price_data, xjo_close, regime="none"):
+def run_portfolio(price_data, xjo_close, regime="none",
+                  rs_top20=False,
+                  min_triggers_up=0, min_triggers_down=0,
+                  trail_after_be=False):
     """
     Chronological portfolio simulation.
 
     Parameters
     ----------
-    regime : str — one of "none", "ema50", "ema200", "ema50_slope"
+    regime           : "none" | "ema50" | "ema200" | "ema50_slope"
+                       Gate that blocks ALL signals when XJO is in downtrend.
+    rs_top20         : if True, only take signals where RS vs XJO is in the
+                       top 20% of the universe on that date (cross-sectional).
+    min_triggers_up  : min entry triggers (0-3) required when XJO > 200 EMA.
+                       0 = no trigger filter.
+    min_triggers_down: min entry triggers required when XJO < 200 EMA.
+    trail_after_be   : if True, after breakeven replace fixed 2:1 target with
+                       a 2xATR trailing stop (let winners run).
 
     Returns
     -------
@@ -257,9 +279,22 @@ def run_portfolio(price_data, xjo_close, regime="none"):
     # 1. Compute indicators for every ticker
     xjo_uptrend = _xjo_uptrend_series(xjo_close, regime)
 
+    # XJO vs its own 200 EMA — used for dynamic trigger threshold
+    xjo_above_200 = (xjo_close > _ema(xjo_close, EMA_SLOW)).to_dict()
+
     ind = {}
     for ticker, raw_df in price_data.items():
         ind[ticker] = compute_indicators(raw_df, xjo_close, xjo_uptrend)
+
+    # Cross-sectional RS percentile threshold (80th pct per date across universe)
+    rs_pct80: dict = {}
+    if rs_top20:
+        date_rs: dict = defaultdict(list)
+        for d_tmp in ind.values():
+            for dt_tmp, val in d_tmp["rs_vs_xjo"].dropna().items():
+                date_rs[dt_tmp].append(val)
+        rs_pct80 = {dt: float(np.percentile(vals, 80))
+                    for dt, vals in date_rs.items() if len(vals) >= 5}
 
     # 2. Pre-scan all potential entry signals
     #    Format: entry_date -> list of candidate dicts
@@ -273,9 +308,27 @@ def run_portfolio(price_data, xjo_close, regime="none"):
         atrs  = d["atr"].values
         n     = len(d)
 
+        trig_counts = d["trigger_count"].values
+        rs_vals     = d["rs_vs_xjo"].values
+
         for i in range(WARMUP, n - 1):
             if not sigs.iloc[i]:
                 continue
+
+            # RS top-20% cross-sectional filter
+            if rs_top20:
+                rv  = float(rs_vals[i])
+                thr = rs_pct80.get(idx[i], -np.inf)
+                if np.isnan(rv) or rv < thr:
+                    continue
+
+            # Dynamic trigger threshold: require more signals in downtrend
+            if min_triggers_up > 0 or min_triggers_down > 0:
+                up_here = bool(xjo_above_200.get(idx[i], True))
+                min_req = min_triggers_up if up_here else min_triggers_down
+                if int(trig_counts[i]) < min_req:
+                    continue
+
             entry_open = opens[i + 1]
             atr_val    = atrs[i]
             if entry_open <= 0 or atr_val <= 0:
@@ -318,8 +371,16 @@ def run_portfolio(price_data, xjo_close, regime="none"):
 
             # Breakeven trigger
             if not pos["be_set"] and c >= pos["be_lvl"]:
-                pos["stop"]   = pos["entry"]
-                pos["be_set"] = True
+                pos["stop"]       = pos["entry"]
+                pos["be_set"]     = True
+                pos["trail_high"] = c   # start trailing from BE trigger bar
+
+            # Trailing stop: ratchet up after BE (only when trail_after_be=True)
+            if pos["be_set"] and pos["trail_after_be"]:
+                pos["trail_high"] = max(pos["trail_high"], c)
+                atr_now = float(d["atr"].loc[dt])
+                trail_stop = pos["trail_high"] - ATR_STOP_MULTIPLE * atr_now
+                pos["stop"] = max(pos["stop"], trail_stop)   # only move up
 
             # Exit conditions (evaluated on close)
             exit_type = None
@@ -400,16 +461,20 @@ def run_portfolio(price_data, xjo_close, regime="none"):
                     continue
 
                 open_pos[ticker] = {
-                    "entry_date":   dt,
-                    "entry":        ep,
-                    "shares":       shares,
-                    "initial_risk": initial_risk,
-                    "risk_aud":     risk_aud,
-                    "stop":         ep - initial_risk,
-                    "target":       ep + TARGET_R * initial_risk,
-                    "be_lvl":       ep + BREAKEVEN_R * initial_risk,
-                    "be_set":       False,
-                    "bars_held":    0,
+                    "entry_date":    dt,
+                    "entry":         ep,
+                    "shares":        shares,
+                    "initial_risk":  initial_risk,
+                    "risk_aud":      risk_aud,
+                    "stop":          ep - initial_risk,
+                    # trail variant: no fixed target — exit via trailing stop only
+                    "target":        (ep + TARGET_R * initial_risk
+                                      if not trail_after_be else np.inf),
+                    "be_lvl":        ep + BREAKEVEN_R * initial_risk,
+                    "be_set":        False,
+                    "trail_high":    ep,
+                    "trail_after_be":trail_after_be,
+                    "bars_held":     0,
                 }
 
     # 6. Force-close any positions remaining at end of data
@@ -831,10 +896,38 @@ def parse_args():
 
 
 SCENARIOS = [
-    {"regime": "none",       "label": "No filter"},
-    {"regime": "ema50",      "label": "XJO > 50 EMA"},
-    {"regime": "ema200",     "label": "XJO > 200 EMA"},
-    {"regime": "ema50_slope","label": "XJO > 50 EMA + slope rising"},
+    {
+        "label":             "Baseline",
+        "regime":            "none",
+        "rs_top20":          False,
+        "min_triggers_up":   0,
+        "min_triggers_down": 0,
+        "trail_after_be":    False,
+    },
+    {
+        "label":             "RS top 20%",
+        "regime":            "none",
+        "rs_top20":          True,
+        "min_triggers_up":   0,
+        "min_triggers_down": 0,
+        "trail_after_be":    False,
+    },
+    {
+        "label":             "RS top 20% + dynamic signals (2:1 target)",
+        "regime":            "none",
+        "rs_top20":          True,
+        "min_triggers_up":   2,
+        "min_triggers_down": 3,
+        "trail_after_be":    False,
+    },
+    {
+        "label":             "RS top 20% + dynamic signals (trail stop)",
+        "regime":            "none",
+        "rs_top20":          True,
+        "min_triggers_up":   2,
+        "min_triggers_down": 3,
+        "trail_after_be":    True,
+    },
 ]
 
 
@@ -871,7 +964,7 @@ def _comparison_table(results):
 
     sep = "=" * (met_w + col_w * len(labels) + 4)
     print(f"\n{sep}")
-    print(f"  REGIME FILTER — 4-SCENARIO COMPARISON  ({date.today()})")
+    print(f"  RS SELECTION + DYNAMIC SIGNALS — 4-SCENARIO COMPARISON  ({date.today()})")
     print(sep)
 
     # header
@@ -1009,13 +1102,19 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     today = date.today().strftime("%Y%m%d")
 
-    # Run all 4 scenarios
+    # Run all scenarios
     all_results = []
     for sc in SCENARIOS:
-        regime = sc["regime"]
-        label  = sc["label"]
+        label = sc["label"]
         print(f"Running: {label} ...")
-        trades_df, equity_df = run_portfolio(price_data, xjo_close, regime=regime)
+        trades_df, equity_df = run_portfolio(
+            price_data, xjo_close,
+            regime            = sc["regime"],
+            rs_top20          = sc["rs_top20"],
+            min_triggers_up   = sc["min_triggers_up"],
+            min_triggers_down = sc["min_triggers_down"],
+            trail_after_be    = sc["trail_after_be"],
+        )
         if trades_df.empty:
             print(f"  No trades generated.")
             continue
@@ -1026,8 +1125,8 @@ def main():
               f"PF {m['profit_factor']}  |  "
               f"return {m.get('pct_return', '—')}%")
 
-        # Save trade log + chart for each scenario
-        slug = regime.replace("_", "-")
+        # Save trade log + chart per scenario
+        slug = label.lower().replace(" ", "_").replace("(","").replace(")","").replace("%","pct").replace(":","")[:40]
         trades_df.to_csv(RESULTS_DIR / f"trades_{slug}_{today}.csv", index=False)
         equity_df.to_csv(RESULTS_DIR / f"equity_{slug}_{today}.csv", index=False)
         save_chart(trades_df, equity_df, m,
