@@ -161,7 +161,7 @@ def download_universe(tickers, period):
 # Indicators & signals
 # ---------------------------------------------------------------------------
 
-def compute_indicators(df, xjo_close=None):
+def compute_indicators(df, xjo_close=None, xjo_uptrend=None):
     d = df.copy()
     d["ema50"]      = _ema(d["Close"], EMA_FAST)
     d["ema200"]     = _ema(d["Close"], EMA_SLOW)
@@ -177,6 +177,11 @@ def compute_indicators(df, xjo_close=None):
         d["rs_vs_xjo"] = d["stock_r63"] - d["xjo_r63"]
     else:
         d["rs_vs_xjo"] = np.nan
+    # Market regime: XJO above its own 50 EMA
+    if xjo_uptrend is not None:
+        d["xjo_uptrend"] = xjo_uptrend.reindex(d.index, method="ffill").fillna(False)
+    else:
+        d["xjo_uptrend"] = True   # default: always on (backwards-compat)
     return d
 
 
@@ -192,7 +197,8 @@ def find_signals(d):
         (d["rsi"]        <= RSI_MAX)            &
         (d["Close"]      <= MAX_PRICE)          &
         (d["atr_pct"]    >= MIN_ATR_PCT)        &
-        (d["rs_vs_xjo"]  >  0)
+        (d["rs_vs_xjo"]  >  0)                 &
+        (d["xjo_uptrend"] == True)              # market regime filter
     )
 
 
@@ -212,9 +218,13 @@ def run_portfolio(price_data, xjo_close):
 
     # 1. Compute indicators for every ticker
     print("  Computing indicators ...")
+    # Market regime filter: XJO above its own 50 EMA
+    xjo_ema50     = _ema(xjo_close, EMA_FAST)
+    xjo_uptrend   = (xjo_close > xjo_ema50)   # True = uptrend, signals allowed
+
     ind = {}
     for ticker, raw_df in price_data.items():
-        ind[ticker] = compute_indicators(raw_df, xjo_close)
+        ind[ticker] = compute_indicators(raw_df, xjo_close, xjo_uptrend)
 
     # 2. Pre-scan all potential entry signals
     #    Format: entry_date -> list of candidate dicts
@@ -762,7 +772,7 @@ def save_chart(trades_df, equity_df, metrics, out_path):
     fig.text(0.5, 0.002,
              f"Stop: {ATR_STOP_MULTIPLE}x ATR  |  Target: {TARGET_R}:1  |  "
              f"Breakeven @ 1R  |  Time stop: {TIME_STOP_DAYS}d  |  "
-             f"Filters: ATR>={MIN_ATR_PCT}%  price<=${MAX_PRICE:.0f}  RS>XJO>0",
+             f"Filters: ATR>={MIN_ATR_PCT}%  price<=${MAX_PRICE:.0f}  RS>XJO>0  XJO>EMA50",
              color=GREY, fontsize=7.5, ha="center")
 
     plt.savefig(out_path, dpi=130, bbox_inches="tight", facecolor=BG)
@@ -805,7 +815,7 @@ def main():
     print(f"Period   : {args.period}")
     print(f"Account  : ${STARTING_BALANCE:,}  |  "
           f"Risk: {RISK_PCT*100:.1f}%/trade  |  Max positions: {MAX_POSITIONS}")
-    print(f"Filters  : ATR>={MIN_ATR_PCT}%  price<=${MAX_PRICE:.0f}  RS>XJO>0  (+ all base filters)")
+    print(f"Filters  : ATR>={MIN_ATR_PCT}%  price<=${MAX_PRICE:.0f}  RS>XJO>0  XJO>EMA50  (+ all base filters)")
     print(f"Exit     : stop={ATR_STOP_MULTIPLE}xATR  "
           f"breakeven@1R  target={TARGET_R}:1  time_stop={TIME_STOP_DAYS}d\n")
 
