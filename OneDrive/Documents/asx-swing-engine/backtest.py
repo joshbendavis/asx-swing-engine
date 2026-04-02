@@ -206,9 +206,47 @@ def find_signals(d):
 # Portfolio simulator
 # ---------------------------------------------------------------------------
 
-def run_portfolio(price_data, xjo_close):
+REGIME_SLOPE_DAYS = 10   # bars to measure EMA50 slope direction
+
+def _xjo_uptrend_series(xjo_close, regime):
+    """
+    Return a boolean Series aligned to xjo_close dates.
+    True on each bar means 'signals are allowed'.
+
+    regime options
+    --------------
+    "none"       : always True (no regime filter)
+    "ema50"      : XJO close > XJO 50 EMA
+    "ema200"     : XJO close > XJO 200 EMA
+    "ema50_slope": XJO close > XJO 50 EMA  AND  50 EMA is rising
+                   (EMA50[today] > EMA50[10 bars ago])
+    """
+    if regime == "none":
+        return pd.Series(True, index=xjo_close.index)
+
+    xjo_ema50  = _ema(xjo_close, EMA_FAST)
+    xjo_ema200 = _ema(xjo_close, EMA_SLOW)
+
+    if regime == "ema50":
+        return xjo_close > xjo_ema50
+
+    if regime == "ema200":
+        return xjo_close > xjo_ema200
+
+    if regime == "ema50_slope":
+        slope_rising = xjo_ema50 > xjo_ema50.shift(REGIME_SLOPE_DAYS)
+        return (xjo_close > xjo_ema50) & slope_rising
+
+    raise ValueError(f"Unknown regime: {regime!r}")
+
+
+def run_portfolio(price_data, xjo_close, regime="none"):
     """
     Chronological portfolio simulation.
+
+    Parameters
+    ----------
+    regime : str — one of "none", "ema50", "ema200", "ema50_slope"
 
     Returns
     -------
@@ -217,10 +255,7 @@ def run_portfolio(price_data, xjo_close):
     """
 
     # 1. Compute indicators for every ticker
-    print("  Computing indicators ...")
-    # Market regime filter: XJO above its own 50 EMA
-    xjo_ema50     = _ema(xjo_close, EMA_FAST)
-    xjo_uptrend   = (xjo_close > xjo_ema50)   # True = uptrend, signals allowed
+    xjo_uptrend = _xjo_uptrend_series(xjo_close, regime)
 
     ind = {}
     for ticker, raw_df in price_data.items():
@@ -795,6 +830,140 @@ def parse_args():
     return p.parse_args()
 
 
+SCENARIOS = [
+    {"regime": "none",       "label": "No filter"},
+    {"regime": "ema50",      "label": "XJO > 50 EMA"},
+    {"regime": "ema200",     "label": "XJO > 200 EMA"},
+    {"regime": "ema50_slope","label": "XJO > 50 EMA + slope rising"},
+]
+
+
+def _comparison_table(results):
+    """
+    results : list of (label, metrics_dict)
+    Prints a side-by-side comparison table, with * marking best value per row.
+    """
+    KEY_METRICS = [
+        ("total_trades",      "Trades"),
+        ("win_rate_pct",      "Win rate %"),
+        ("wins",              "  Targets"),
+        ("losses",            "  Stops"),
+        ("time_stops",        "  Time stops"),
+        ("profit_factor",     "Profit factor"),
+        ("avg_r",             "Avg R / trade"),
+        ("expectancy_aud",    "Expectancy $"),
+        ("total_pnl_aud",     "Total P&L $"),
+        ("final_account",     "Final account $"),
+        ("pct_return",        "Total return %"),
+        ("max_drawdown_aud",  "Max drawdown $"),
+        ("max_drawdown_pct",  "Max drawdown %"),
+        ("max_consec_losses", "Max consec. losses"),
+        ("sharpe",            "Sharpe"),
+        ("avg_hold_days",     "Avg hold days"),
+    ]
+    # lower-is-better metrics (we want the minimum)
+    LOWER_IS_BETTER = {"losses", "time_stops", "max_drawdown_aud",
+                       "max_drawdown_pct", "max_consec_losses"}
+
+    labels  = [lbl for lbl, _ in results]
+    col_w   = max(24, max(len(l) for l in labels) + 2)
+    met_w   = 22
+
+    sep = "=" * (met_w + col_w * len(labels) + 4)
+    print(f"\n{sep}")
+    print(f"  REGIME FILTER — 4-SCENARIO COMPARISON  ({date.today()})")
+    print(sep)
+
+    # header
+    hdr = f"  {'Metric':<{met_w}}"
+    for lbl in labels:
+        hdr += f"  {lbl:^{col_w - 2}}"
+    print(hdr)
+    print("-" * (met_w + col_w * len(labels) + 4))
+
+    for key, display in KEY_METRICS:
+        vals = [m.get(key, None) for _, m in results]
+
+        # Format cell values
+        def fmt(v):
+            if v is None:
+                return "—"
+            if key in ("expectancy_aud", "total_pnl_aud",
+                       "final_account", "max_drawdown_aud"):
+                return f"${v:,.0f}"
+            if key == "pct_return":
+                return f"{v:+.1f}%"
+            if key == "max_drawdown_pct":
+                return f"{v:.1f}%"
+            if key == "win_rate_pct":
+                return f"{v:.1f}%"
+            return str(v)
+
+        # Find best value
+        numeric = [(i, v) for i, v in enumerate(vals)
+                   if isinstance(v, (int, float))]
+        if numeric:
+            best_i = (min(numeric, key=lambda x: x[1]) if key in LOWER_IS_BETTER
+                      else max(numeric, key=lambda x: x[1]))[0]
+        else:
+            best_i = -1
+
+        row = f"  {display:<{met_w}}"
+        for i, v in enumerate(vals):
+            cell   = fmt(v)
+            marker = " *" if i == best_i and len(numeric) > 1 else "  "
+            row   += f"  {cell:^{col_w - 4}}{marker}"
+        print(row)
+
+    print(sep)
+    print("  * = best value in row\n")
+
+    # Year-by-year sub-table
+    print(f"  YEAR-BY-YEAR P&L")
+    print("-" * (met_w + col_w * len(labels) + 4))
+    yr_hdr = f"  {'Year':<{met_w}}"
+    for lbl in labels:
+        yr_hdr += f"  {lbl:^{col_w - 2}}"
+    print(yr_hdr)
+    print("-" * (met_w + col_w * len(labels) + 4))
+
+    all_years = sorted(set(
+        yr for _, m in results for yr in m.get("yearly", {}).keys()
+    ))
+    for yr in all_years:
+        row = f"  {str(yr):<{met_w}}"
+        yr_vals = []
+        for _, m in results:
+            y = m.get("yearly", {}).get(yr)
+            if y:
+                sign = "+" if y["pnl_aud"] >= 0 else ""
+                cell = f"{sign}${y['pnl_aud']:,.0f} ({y['return_pct']:+.1f}%)"
+            else:
+                cell = "—"
+            yr_vals.append(y["pnl_aud"] if y else None)
+            row += f"  {cell:^{col_w - 2}}"
+
+        # star best year
+        num_yr = [(i, v) for i, v in enumerate(yr_vals) if v is not None]
+        if num_yr:
+            best_yr_i = max(num_yr, key=lambda x: x[1])[0]
+            # rebuild row with star
+            row = f"  {str(yr):<{met_w}}"
+            for i, (_, m) in enumerate(results):
+                y = m.get("yearly", {}).get(yr)
+                if y:
+                    sign = "+" if y["pnl_aud"] >= 0 else ""
+                    cell = f"{sign}${y['pnl_aud']:,.0f} ({y['return_pct']:+.1f}%)"
+                else:
+                    cell = "—"
+                marker = " *" if i == best_yr_i and len(num_yr) > 1 else "  "
+                row += f"  {cell:^{col_w - 4}}{marker}"
+        print(row)
+
+    print("=" * (met_w + col_w * len(labels) + 4))
+    print("  * = best value in row\n")
+
+
 def main():
     args = parse_args()
 
@@ -815,7 +984,7 @@ def main():
     print(f"Period   : {args.period}")
     print(f"Account  : ${STARTING_BALANCE:,}  |  "
           f"Risk: {RISK_PCT*100:.1f}%/trade  |  Max positions: {MAX_POSITIONS}")
-    print(f"Filters  : ATR>={MIN_ATR_PCT}%  price<=${MAX_PRICE:.0f}  RS>XJO>0  XJO>EMA50  (+ all base filters)")
+    print(f"Base filters: ATR>={MIN_ATR_PCT}%  price<=${MAX_PRICE:.0f}  RS>XJO>0")
     print(f"Exit     : stop={ATR_STOP_MULTIPLE}xATR  "
           f"breakeven@1R  target={TARGET_R}:1  time_stop={TIME_STOP_DAYS}d\n")
 
@@ -828,7 +997,7 @@ def main():
     xjo_close = (_xjo.iloc[:, 0] if isinstance(_xjo, pd.DataFrame) else _xjo).dropna()
     print(f"  {len(xjo_close)} benchmark bars.\n")
 
-    # Price history
+    # Download price data once — reused across all scenarios
     print("Downloading price history ...")
     price_data = download_universe(tickers, args.period)
     print(f"  Data for {len(price_data)} / {len(tickers)} tickers.\n")
@@ -837,30 +1006,36 @@ def main():
         print("No data downloaded. Check connection.")
         sys.exit(1)
 
-    # Portfolio simulation
-    print("Running portfolio simulation ...")
-    trades_df, equity_df = run_portfolio(price_data, xjo_close)
-
-    if trades_df.empty:
-        print("No trades generated.")
-        sys.exit(0)
-
-    metrics = calc_metrics(trades_df, equity_df)
-    print_results(metrics)
-
-    # Save outputs
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    today      = date.today().strftime("%Y%m%d")
-    csv_path   = RESULTS_DIR / f"portfolio_trades_{today}.csv"
-    eq_path    = RESULTS_DIR / f"equity_curve_{today}.csv"
-    chart_path = RESULTS_DIR / f"portfolio_backtest_{today}.png"
+    today = date.today().strftime("%Y%m%d")
 
-    trades_df.to_csv(csv_path, index=False)
-    equity_df.to_csv(eq_path,  index=False)
-    save_chart(trades_df, equity_df, metrics, chart_path)
+    # Run all 4 scenarios
+    all_results = []
+    for sc in SCENARIOS:
+        regime = sc["regime"]
+        label  = sc["label"]
+        print(f"Running: {label} ...")
+        trades_df, equity_df = run_portfolio(price_data, xjo_close, regime=regime)
+        if trades_df.empty:
+            print(f"  No trades generated.")
+            continue
+        m = calc_metrics(trades_df, equity_df)
+        all_results.append((label, m))
+        print(f"  {m['total_trades']} trades  |  "
+              f"win {m['win_rate_pct']}%  |  "
+              f"PF {m['profit_factor']}  |  "
+              f"return {m.get('pct_return', '—')}%")
 
-    print(f"\n  Trade log  -> {csv_path}")
-    print(f"  Equity CSV -> {eq_path}")
+        # Save trade log + chart for each scenario
+        slug = regime.replace("_", "-")
+        trades_df.to_csv(RESULTS_DIR / f"trades_{slug}_{today}.csv", index=False)
+        equity_df.to_csv(RESULTS_DIR / f"equity_{slug}_{today}.csv", index=False)
+        save_chart(trades_df, equity_df, m,
+                   RESULTS_DIR / f"backtest_{slug}_{today}.png")
+
+    # Side-by-side comparison
+    if all_results:
+        _comparison_table(all_results)
 
 
 if __name__ == "__main__":
