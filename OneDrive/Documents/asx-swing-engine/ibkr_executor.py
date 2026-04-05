@@ -58,6 +58,11 @@ MAX_POSITIONS    = 6                    # max concurrent open positions
 MIN_SHARES       = 1                    # minimum viable parcel
 MIN_TRIGGERS     = 2                    # only trade signals with >= N triggers
 
+# Optional: set in .env to override live NAV for sizing (paper mode only).
+# Useful when paper account is funded at $1M but you want to size as $20k.
+#   PAPER_BALANCE_OVERRIDE=20000
+PAPER_BALANCE_OVERRIDE = os.getenv("PAPER_BALANCE_OVERRIDE", "").strip()
+
 SIGNALS_CSV      = Path("results/signals_output.csv")
 TRADE_LOG        = Path("logs/trades.csv")
 
@@ -179,6 +184,32 @@ def _already_ordered_today(ib, symbol: str) -> bool:
     return False
 
 
+def _round_to_tick(price: float) -> float:
+    """
+    Snap a price to the nearest valid ASX minimum price variation (tick size).
+
+    ASX tick schedule:
+        price <  $0.10  ->  $0.001 ticks
+        price <= $2.00  ->  $0.005 ticks
+        price >  $2.00  ->  $0.010 ticks
+
+    Uses Decimal arithmetic to avoid floating-point rounding artefacts
+    (e.g. 255 * 0.01 = 2.5499999... in IEEE 754).
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+
+    if price < 0.10:
+        tick = Decimal("0.001")
+    elif price <= 2.00:
+        tick = Decimal("0.005")
+    else:
+        tick = Decimal("0.010")
+
+    price_d = Decimal(str(price))
+    snapped  = (price_d / tick).to_integral_value(ROUND_HALF_UP) * tick
+    return float(snapped)
+
+
 def _make_contract(symbol: str):
     """Return a qualified ASX Stock contract for the given symbol (no .AX suffix)."""
     from ib_insync import Stock
@@ -202,15 +233,22 @@ def _place_bracket(
         tp      : LMT SELL @ target  (OCA)
         sl      : STP SELL @ stop    (OCA)
     All three are linked via OCA group and transmitted together.
+    All prices are snapped to the correct ASX tick size before submission.
     """
     from ib_insync import LimitOrder, StopOrder
+
+    # Snap all prices to valid ASX tick sizes before sending
+    entry_p  = _round_to_tick(entry)
+    target_p = _round_to_tick(target)
+    stop_p   = _round_to_tick(stop_loss)
 
     oca_group = f"{order_ref}-OCA"
 
     parent = LimitOrder(
         action        = "BUY",
         totalQuantity = shares,
-        lmtPrice      = round(entry, 3),
+        lmtPrice      = entry_p,
+        tif           = "GTC",          # Good-Till-Cancelled: survives overnight / weekend
         orderRef      = order_ref,
         account       = IBKR_ACCOUNT,
         transmit      = False,          # hold until children are attached
@@ -219,7 +257,8 @@ def _place_bracket(
     take_profit = LimitOrder(
         action        = "SELL",
         totalQuantity = shares,
-        lmtPrice      = round(target, 3),
+        lmtPrice      = target_p,
+        tif           = "GTC",
         orderRef      = order_ref + "-TP",
         ocaGroup      = oca_group,
         ocaType       = 1,              # cancel remaining when one fills
@@ -231,7 +270,8 @@ def _place_bracket(
     stop_loss_order = StopOrder(
         action        = "SELL",
         totalQuantity = shares,
-        stopPrice     = round(stop_loss, 3),
+        stopPrice     = stop_p,
+        tif           = "GTC",
         orderRef      = order_ref + "-SL",
         ocaGroup      = oca_group,
         ocaType       = 1,
@@ -278,7 +318,7 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
 
     signals = pd.read_csv(signals_path)
     if signals.empty:
-        log.info("No signals in %s — nothing to trade.", signals_path)
+        log.info("No signals in %s - nothing to trade.", signals_path)
         return 0
 
     # Filter to minimum trigger count
@@ -297,16 +337,25 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
 
     # ── Account balance + position headroom ───────────────────────────────────
     if dry_run:
-        balance        = 20_000.0
+        # In dry-run, prefer the override; fall back to $20k simulation
+        balance        = float(PAPER_BALANCE_OVERRIDE) if PAPER_BALANCE_OVERRIDE else 20_000.0
         open_positions = 0
-        log.info("[DRY-RUN] Using simulated balance $%.2f, 0 open positions", balance)
+        log.info("[DRY-RUN] Using balance $%.2f AUD, 0 open positions", balance)
     else:
-        balance        = _get_account_balance(ib)
         open_positions = _count_open_positions(ib)
-        log.info(
-            "Account balance: $%.2f AUD  |  Open positions: %d / %d",
-            balance, open_positions, MAX_POSITIONS,
-        )
+        if PAPER and PAPER_BALANCE_OVERRIDE:
+            balance = float(PAPER_BALANCE_OVERRIDE)
+            log.info(
+                "PAPER_BALANCE_OVERRIDE: sizing against $%.2f AUD  "
+                "|  Open positions: %d / %d",
+                balance, open_positions, MAX_POSITIONS,
+            )
+        else:
+            balance = _get_account_balance(ib)
+            log.info(
+                "Account balance: $%.2f AUD  |  Open positions: %d / %d",
+                balance, open_positions, MAX_POSITIONS,
+            )
 
     headroom = MAX_POSITIONS - open_positions
     if headroom <= 0:
@@ -334,7 +383,7 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
         score        = float(row.get("composite_score", 0))
 
         if risk_per_shr <= 0:
-            log.warning("%-6s: invalid risk_per_share (entry=%.3f stop=%.3f) — skipping.", symbol, entry, stop_loss)
+            log.warning("%-6s: invalid risk_per_share (entry=%.3f stop=%.3f) - skipping.", symbol, entry, stop_loss)
             continue
 
         # Position size
@@ -343,7 +392,7 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
 
         if shares < MIN_SHARES:
             log.warning(
-                "%-6s: sized to %d shares (risk $%.2f / share $%.4f) — below minimum, skipping.",
+                "%-6s: sized to %d shares (risk $%.2f / share $%.4f) - below minimum, skipping.",
                 symbol, shares, risk_aud, risk_per_shr,
             )
             continue
@@ -352,7 +401,7 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
 
         # ── Duplicate guard ───────────────────────────────────────────────────
         if not dry_run and _already_ordered_today(ib, symbol):
-            log.info("%-6s: order already submitted today — skipping.", symbol)
+            log.info("%-6s: order already submitted today - skipping.", symbol)
             continue
 
         log.info(
@@ -449,7 +498,7 @@ if __name__ == "__main__":
         live_confirm = os.getenv("IBKR_LIVE_CONFIRMED", "").strip().lower()
         if live_confirm != "yes":
             log.error(
-                "LIVE trading requires IBKR_LIVE_CONFIRMED=yes in .env.  "
+                "LIVE trading requires IBKR_LIVE_CONFIRMED=yes in .env. "
                 "Set PAPER=True to use paper trading."
             )
             sys.exit(1)
