@@ -211,9 +211,9 @@ def _round_to_tick(price: float) -> float:
 
 
 def _make_contract(symbol: str):
-    """Return a qualified ASX Stock contract for the given symbol (no .AX suffix)."""
+    """Return an ASX Stock contract using SMART routing (avoids direct-route block)."""
     from ib_insync import Stock
-    return Stock(symbol, "ASX", "AUD")
+    return Stock(symbol, "SMART", "AUD")
 
 
 def _place_bracket(
@@ -283,6 +283,12 @@ def _place_bracket(
     contract = _make_contract(symbol)
     ib.qualifyContracts(contract)
 
+    # Force GTC immediately before each placeOrder call so TWS DAY presets
+    # cannot override the value that was set in the constructor above.
+    parent.tif          = "GTC"
+    take_profit.tif     = "GTC"
+    stop_loss_order.tif = "GTC"
+
     # Place parent first to get its orderId
     parent_trade    = ib.placeOrder(contract, parent)
     parent_id       = parent_trade.order.orderId
@@ -290,6 +296,9 @@ def _place_bracket(
     # Wire children to parent
     take_profit.parentId      = parent_id
     stop_loss_order.parentId  = parent_id
+
+    take_profit.tif     = "GTC"     # re-assert after parentId mutation
+    stop_loss_order.tif = "GTC"
 
     tp_trade = ib.placeOrder(contract, take_profit)
     sl_trade = ib.placeOrder(contract, stop_loss_order)
