@@ -5,3 +5,4 @@ requests>=2.31
 matplotlib>=3.8
 mplfinance>=0.12.10b0
 python-dotenv>=1.0
+ib_insync>=0.9.86

@@ -4,22 +4,27 @@ run_daily.py
 Daily orchestrator for the ASX Swing Trade Engine.
 
 Pipeline:
-    1. Run screener -> results/screener_output.csv
-    2. Run signals  -> results/signals_output.csv
+    1. Run screener   -> results/screener_output.csv
+    2. Run signals    -> results/signals_output.csv
     3. Generate charts for top 10 -> results/charts/YYYYMMDD/
     4. Send HTML email with results table + inline charts
+    5. Submit bracket orders to IBKR TWS via ibkr_executor.py
 
 Credentials are read from .env (copy .env.example -> .env and fill in):
-    EMAIL_FROM      your email address
-    EMAIL_PASSWORD  app password (NOT your regular login password)
-    EMAIL_TO        recipient (defaults to EMAIL_FROM)
-    SMTP_HOST       default: smtp-mail.outlook.com
-    SMTP_PORT       default: 587
+    EMAIL_FROM          your email address
+    EMAIL_PASSWORD      app password (NOT your regular login password)
+    EMAIL_TO            recipient (defaults to EMAIL_FROM)
+    SMTP_HOST           default: smtp-mail.outlook.com
+    SMTP_PORT           default: 587
+    IBKR_ACCOUNT        TWS account ID (default: DUK913437)
+    IBKR_LIVE_CONFIRMED set to "yes" only when flipping ibkr_executor.py to live
 
 Usage:
-    python run_daily.py            # full run (screener + signals + charts + email)
-    python run_daily.py --no-email # screener + signals + charts only
-    python run_daily.py --no-charts --no-email  # screener + signals only
+    python run_daily.py                          # full pipeline
+    python run_daily.py --no-email               # skip email
+    python run_daily.py --no-ibkr                # skip order submission
+    python run_daily.py --ibkr-dry-run           # print IBKR orders without submitting
+    python run_daily.py --no-charts --no-email   # screener + signals only
 """
 
 import argparse
@@ -53,6 +58,7 @@ log = logging.getLogger("asx-swing")
 # ── imports (after logging is configured) ─────────────────────────────────────
 from screener import run_screener
 from signals import run_signals
+from ibkr_executor import run_executor as ibkr_run
 from utils.charts import generate_charts
 from utils.emailer import send_email
 
@@ -61,10 +67,12 @@ from utils.emailer import send_email
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ASX Swing Engine - daily run")
-    p.add_argument("--no-charts",  action="store_true", help="Skip chart generation")
-    p.add_argument("--no-email",   action="store_true", help="Skip sending email")
-    p.add_argument("--no-signals", action="store_true", help="Skip signal scanner")
-    p.add_argument("--top-n",      type=int, default=10, help="Charts for top N (default 10)")
+    p.add_argument("--no-charts",    action="store_true", help="Skip chart generation")
+    p.add_argument("--no-email",     action="store_true", help="Skip sending email")
+    p.add_argument("--no-signals",   action="store_true", help="Skip signal scanner")
+    p.add_argument("--no-ibkr",      action="store_true", help="Skip IBKR order submission")
+    p.add_argument("--ibkr-dry-run", action="store_true", help="IBKR dry-run: print orders, do not submit")
+    p.add_argument("--top-n",        type=int, default=10, help="Charts for top N (default 10)")
     return p.parse_args()
 
 
@@ -76,7 +84,7 @@ def main() -> None:
     log.info("=" * 62)
 
     # ── 1. Screener ───────────────────────────────────────────────────────────
-    log.info("Step 1/4 - Running screener ...")
+    log.info("Step 1/5 - Running screener ...")
     try:
         results = run_screener()
     except Exception as exc:
@@ -102,7 +110,7 @@ def main() -> None:
 
     # ── 2. Signals ────────────────────────────────────────────────────────────
     if not args.no_signals:
-        log.info("Step 2/4 - Running signal scanner ...")
+        log.info("Step 2/5 - Running signal scanner ...")
         try:
             signals = run_signals()
             if signals.empty:
@@ -117,13 +125,13 @@ def main() -> None:
             log.error("Signal scanner failed: %s", exc, exc_info=True)
             # Non-fatal - continue to charts and email
     else:
-        log.info("Step 2/4 - Signals skipped (--no-signals).")
+        log.info("Step 2/5 - Signals skipped (--no-signals).")
 
     # ── 3. Charts ─────────────────────────────────────────────────────────────
     chart_paths: list[tuple[str, str]] = []
 
     if not args.no_charts:
-        log.info("Step 3/4 - Generating charts for top %d ...", args.top_n)
+        log.info("Step 3/5 - Generating charts for top %d ...", args.top_n)
         try:
             chart_paths = generate_charts(results, top_n=args.top_n)
             log.info("Generated %d chart(s).", len(chart_paths))
@@ -131,11 +139,11 @@ def main() -> None:
             log.error("Chart generation failed: %s", exc, exc_info=True)
             # Non-fatal - continue to email with no charts
     else:
-        log.info("Step 3/4 - Charts skipped (--no-charts).")
+        log.info("Step 3/5 - Charts skipped (--no-charts).")
 
     # ── 4. Email ──────────────────────────────────────────────────────────────
     if not args.no_email:
-        log.info("Step 4/4 - Sending email ...")
+        log.info("Step 4/5 - Sending email ...")
 
         email_from = os.getenv("EMAIL_FROM", "").strip()
         email_pass = os.getenv("EMAIL_PASSWORD", "").strip()
@@ -163,7 +171,25 @@ def main() -> None:
             except Exception as exc:
                 log.error("Email failed: %s", exc, exc_info=True)
     else:
-        log.info("Step 4/4 - Email skipped (--no-email).")
+        log.info("Step 4/5 - Email skipped (--no-email).")
+
+    # ── 5. IBKR order submission ───────────────────────────────────────────────
+    if args.no_ibkr:
+        log.info("Step 5/5 - IBKR skipped (--no-ibkr).")
+    else:
+        sig_path = Path("results") / "signals_output.csv"
+        if not sig_path.exists():
+            log.warning("Step 5/5 - signals_output.csv not found, skipping IBKR.")
+        else:
+            dry = args.ibkr_dry_run
+            mode_label = "DRY-RUN" if dry else "LIVE SUBMIT"
+            log.info("Step 5/5 - IBKR order submission [%s] ...", mode_label)
+            try:
+                n = ibkr_run(sig_path, dry_run=dry)
+                log.info("IBKR: %d bracket order(s) submitted.", n)
+            except Exception as exc:
+                log.error("IBKR executor failed: %s", exc, exc_info=True)
+                # Non-fatal - pipeline still completes
 
     log.info("=" * 62)
     log.info("  Daily run complete.  Log -> %s", log_file)
