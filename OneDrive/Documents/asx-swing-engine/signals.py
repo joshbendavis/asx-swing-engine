@@ -20,6 +20,7 @@ Trade levels (based on today's close):
 Output ranked by screener composite score → results/signals_output.csv
 """
 
+import json
 import os
 import sys
 import time
@@ -40,6 +41,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 SCREENER_CSV    = Path("results/screener_output.csv")
 OUTPUT_CSV      = Path("results/signals_output.csv")
+REGIME_JSON     = Path("results/regime.json")
 
 HISTORY_PERIOD  = "6mo"        # enough for MACD warm-up (26 + 9 + buffer)
 BATCH_SIZE      = 20
@@ -80,6 +82,26 @@ def _suppress_yf_noise():
             yield
         finally:
             sys.stderr = old
+
+
+# ---------------------------------------------------------------------------
+# Regime helper
+# ---------------------------------------------------------------------------
+
+def _load_regime() -> dict:
+    """
+    Load results/regime.json and return the parsed dict.
+    Returns a safe BULL default if the file is missing or unreadable.
+    """
+    default = {"regime": "BULL", "position_size_multiplier": 1.0}
+    if not REGIME_JSON.exists():
+        return default
+    try:
+        with open(REGIME_JSON, "r") as f:
+            data = json.load(f)
+        return data
+    except Exception:
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -159,10 +181,11 @@ def fetch_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
 # Signal evaluation per ticker
 # ---------------------------------------------------------------------------
 
-def evaluate_signals(ticker: str, df: pd.DataFrame) -> dict | None:
+def evaluate_signals(ticker: str, df: pd.DataFrame,
+                     min_triggers: int = MIN_TRIGGERS) -> dict | None:
     """
     Evaluate the 3 entry triggers for a single ticker.
-    Returns a dict of signal details or None if fewer than MIN_TRIGGERS fire.
+    Returns a dict of signal details or None if fewer than min_triggers fire.
     Requires at least 2 rows of data (today + yesterday).
     """
     if len(df) < max(MACD_SLOW + MACD_SIGNAL + 5, VOL_LONG + 2):
@@ -212,7 +235,7 @@ def evaluate_signals(ticker: str, df: pd.DataFrame) -> dict | None:
     triggers      = [t1_rsi_bounce, t2_macd_cross, t3_vol_break]
     trigger_count = sum(triggers)
 
-    if trigger_count < MIN_TRIGGERS:
+    if trigger_count < min_triggers:
         return None
 
     # ---- Trade levels ----
@@ -261,6 +284,31 @@ def run_signals() -> pd.DataFrame:
     # Build lookup: ticker -> screener row
     screener_map = screener.set_index("ticker")
 
+    # 1b — Load market regime
+    regime_data = _load_regime()
+    regime      = regime_data.get("regime", "BULL")
+    psm         = regime_data.get("position_size_multiplier", 1.0)
+    confidence  = regime_data.get("confidence", None)
+
+    conf_str = f"  confidence={confidence}%" if confidence is not None else ""
+    print(f"Market regime: {regime}{conf_str}  |  position_size_multiplier={psm}")
+
+    if regime == "BEAR":
+        print("WARNING: BEAR regime detected — skipping signal scan. No trades today.")
+        return pd.DataFrame()
+
+    if regime == "CHOPPY":
+        min_triggers = 3
+        print("CHOPPY regime: raising min_triggers to 3 (all 3 conditions must fire).")
+    else:
+        min_triggers = MIN_TRIGGERS
+
+    if regime == "HIGH_VOL":
+        print(
+            "HIGH_VOL regime: position sizes will be halved by ibkr_executor "
+            f"(position_size_multiplier={psm} is in regime.json)."
+        )
+
     # 2 — Download recent OHLCV
     print(f"Downloading {HISTORY_PERIOD} price data for {len(tickers)} tickers ...")
     price_data: dict[str, pd.DataFrame] = {}
@@ -280,7 +328,7 @@ def run_signals() -> pd.DataFrame:
     signals: list[dict] = []
 
     for ticker, df in price_data.items():
-        result = evaluate_signals(ticker, df)
+        result = evaluate_signals(ticker, df, min_triggers=min_triggers)
         if result is None:
             continue
 

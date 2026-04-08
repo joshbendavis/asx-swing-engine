@@ -57,6 +57,7 @@ log = logging.getLogger("asx-swing")
 
 
 # ── imports (after logging is configured) ─────────────────────────────────────
+from regime_detector import run_regime_detector
 from screener import run_screener
 from signals import run_signals
 from ibkr_executor import run_executor as ibkr_run
@@ -85,8 +86,31 @@ def main() -> None:
     log.info("  ASX SWING ENGINE - daily run  %s", datetime.today().strftime("%d %b %Y %H:%M"))
     log.info("=" * 62)
 
+    # ── 0. Regime detector ────────────────────────────────────────────────────
+    log.info("Step 0/6 - Detecting market regime ...")
+    try:
+        regime_result = run_regime_detector()
+        regime        = regime_result["regime"]
+        confidence    = regime_result["confidence"]
+        psm           = regime_result["position_size_multiplier"]
+        log.info(
+            "Regime: %s  |  confidence=%d%%  |  position_size_multiplier=%.2f",
+            regime, confidence, psm,
+        )
+        if regime == "BEAR":
+            log.warning("BEAR regime — screener and signals will run but no orders will be placed.")
+        elif regime == "HIGH_VOL":
+            log.warning("HIGH_VOL regime — position sizes will be reduced to %.0f%%.", psm * 100)
+        elif regime == "CHOPPY":
+            log.warning("CHOPPY regime — signals require all 3 triggers.")
+    except Exception as exc:
+        log.error("Regime detector failed: %s — defaulting to BULL (no restrictions).", exc)
+        regime = "BULL"
+        # Non-fatal: pipeline continues. regime.json may be stale or absent;
+        # signals.py will fall back to BULL defaults automatically.
+
     # ── 1. Screener ───────────────────────────────────────────────────────────
-    log.info("Step 1/5 - Running screener ...")
+    log.info("Step 1/6 - Running screener ...")
     try:
         results = run_screener()
     except Exception as exc:
@@ -112,7 +136,7 @@ def main() -> None:
 
     # ── 2. Signals ────────────────────────────────────────────────────────────
     if not args.no_signals:
-        log.info("Step 2/5 - Running signal scanner ...")
+        log.info("Step 2/6 - Running signal scanner ...")
         try:
             signals = run_signals()
             if signals.empty:
@@ -127,13 +151,13 @@ def main() -> None:
             log.error("Signal scanner failed: %s", exc, exc_info=True)
             # Non-fatal - continue to charts and email
     else:
-        log.info("Step 2/5 - Signals skipped (--no-signals).")
+        log.info("Step 2/6 - Signals skipped (--no-signals).")
 
     # ── 3. Charts ─────────────────────────────────────────────────────────────
     chart_paths: list[tuple[str, str]] = []
 
     if not args.no_charts:
-        log.info("Step 3/5 - Generating charts for top %d ...", args.top_n)
+        log.info("Step 3/6 - Generating charts for top %d ...", args.top_n)
         try:
             chart_paths = generate_charts(results, top_n=args.top_n)
             log.info("Generated %d chart(s).", len(chart_paths))
@@ -141,11 +165,11 @@ def main() -> None:
             log.error("Chart generation failed: %s", exc, exc_info=True)
             # Non-fatal - continue to email with no charts
     else:
-        log.info("Step 3/5 - Charts skipped (--no-charts).")
+        log.info("Step 3/6 - Charts skipped (--no-charts).")
 
     # ── 4. Email ──────────────────────────────────────────────────────────────
     if not args.no_email:
-        log.info("Step 4/5 - Sending email ...")
+        log.info("Step 4/6 - Sending email ...")
 
         email_from = os.getenv("EMAIL_FROM", "").strip()
         email_pass = os.getenv("EMAIL_PASSWORD", "").strip()
@@ -173,19 +197,19 @@ def main() -> None:
             except Exception as exc:
                 log.error("Email failed: %s", exc, exc_info=True)
     else:
-        log.info("Step 4/5 - Email skipped (--no-email).")
+        log.info("Step 4/6 - Email skipped (--no-email).")
 
     # ── 5. IBKR order submission ───────────────────────────────────────────────
     if args.no_ibkr:
-        log.info("Step 5/5 - IBKR skipped (--no-ibkr).")
+        log.info("Step 5/6 - IBKR skipped (--no-ibkr).")
     else:
         sig_path = Path("results") / "signals_output.csv"
         if not sig_path.exists():
-            log.warning("Step 5/5 - signals_output.csv not found, skipping IBKR.")
+            log.warning("Step 5/6 - signals_output.csv not found, skipping IBKR.")
         else:
             dry = args.ibkr_dry_run
             mode_label = "DRY-RUN" if dry else "LIVE SUBMIT"
-            log.info("Step 5/5 - IBKR order submission [%s] ...", mode_label)
+            log.info("Step 5/6 - IBKR order submission [%s] ...", mode_label)
             try:
                 n = ibkr_run(sig_path, dry_run=dry)
                 log.info("IBKR: %d bracket order(s) submitted.", n)

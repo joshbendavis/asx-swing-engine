@@ -13,6 +13,7 @@ Sections
 Auto-refreshes every 5 minutes.
 """
 
+import json
 import math
 from datetime import datetime, date
 from pathlib import Path
@@ -96,6 +97,7 @@ SIGNALS_CSV   = Path("results/signals_output.csv")
 TRADES_CSV    = Path("logs/trades.csv")
 EQUITY_CSV    = Path("results/equity_curve.csv")
 SCREENER_CSV  = Path("results/screener_output.csv")
+REGIME_JSON   = Path("results/regime.json")
 REFRESH_SECS  = 300   # 5 minutes
 STARTING_BALANCE = 20_000.0
 
@@ -122,6 +124,19 @@ def _fmt_pct(v: float) -> str:
 
 def _fmt_aud(v: float) -> str:
     return f"${v:,.0f}" if not math.isnan(v) else "n/a"
+
+
+@st.cache_data(ttl=REFRESH_SECS)
+def _load_regime() -> dict:
+    """Load results/regime.json; return safe BULL defaults if missing."""
+    default = {"regime": "BULL", "position_size_multiplier": 1.0}
+    if not REGIME_JSON.exists():
+        return default
+    try:
+        with open(REGIME_JSON, "r") as f:
+            return json.load(f)
+    except Exception:
+        return default
 
 
 @st.cache_data(ttl=REFRESH_SECS)
@@ -208,6 +223,100 @@ with col_refresh:
         st.rerun()
 
 st.markdown("---")
+
+# ---------------------------------------------------------------------------
+# Regime status bar
+# ---------------------------------------------------------------------------
+_REGIME_COLOURS = {
+    "BULL":     "#26a69a",
+    "CHOPPY":   "#f5a623",
+    "BEAR":     "#ef5350",
+    "HIGH_VOL": "#9c27b0",
+}
+_REGIME_BG = {
+    "BULL":     "#0d2b1e",
+    "CHOPPY":   "#2b1e0d",
+    "BEAR":     "#2b0d0d",
+    "HIGH_VOL": "#1e0d2b",
+}
+
+_rd = _load_regime()
+_regime_name = _rd.get("regime", "UNKNOWN")
+_psm         = _rd.get("position_size_multiplier", 1.0)
+_confidence  = _rd.get("confidence", None)
+_ts          = _rd.get("timestamp", None)
+_ind         = _rd.get("indicators", {})
+
+if _regime_name in _REGIME_COLOURS:
+    _badge_colour = _REGIME_COLOURS[_regime_name]
+    _badge_bg     = _REGIME_BG[_regime_name]
+    _conf_str     = f"Confidence: {_confidence}%" if _confidence is not None else ""
+    _psm_str      = f"Position size: {_psm}&times;"
+    _ts_str       = (
+        f"<span style='color:#444;font-size:11px'>"
+        f"Classified: {_ts}</span>"
+        if _ts else ""
+    )
+
+    # Key indicator snippets
+    _xjo   = _ind.get("xjo_close")
+    _e200  = _ind.get("ema_200")
+    _slope = _ind.get("ema_50_slope")
+    _brd   = _ind.get("market_breadth")
+    _atr_p = _ind.get("atr_pct")
+
+    _ind_parts = []
+    if _xjo is not None and _e200 is not None and _e200 != 0:
+        _vs200 = (_xjo - _e200) / _e200 * 100
+        _vs200_c = "#26a69a" if _vs200 >= 0 else "#ef5350"
+        _ind_parts.append(
+            f"XJO <strong>{_xjo:,.0f}</strong> "
+            f"<span style='color:{_vs200_c}'>{_vs200:+.1f}% vs 200 EMA</span>"
+        )
+    if _slope is not None:
+        _slope_c = "#26a69a" if _slope >= 0 else "#ef5350"
+        _ind_parts.append(
+            f"50 EMA slope <span style='color:{_slope_c}'>{_slope:+.2f}</span>"
+        )
+    if _brd is not None:
+        _ind_parts.append(f"Breadth <strong>{_brd:.0f}%</strong>")
+    if _atr_p is not None:
+        _ind_parts.append(f"ATR <strong>{_atr_p:.1f}%</strong>")
+
+    _ind_html = (
+        "<span style='color:#666;font-size:11px'>"
+        + " &nbsp;·&nbsp; ".join(_ind_parts)
+        + "</span>"
+        if _ind_parts else ""
+    )
+
+    st.markdown(f"""
+    <div style="background:#111111;border:1px solid #2a2a2a;border-radius:8px;
+                padding:12px 18px;display:flex;align-items:center;
+                justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+        <span style="background:{_badge_bg};color:{_badge_colour};
+                     border:1px solid {_badge_colour}66;border-radius:6px;
+                     padding:4px 14px;font-size:15px;font-weight:800;
+                     letter-spacing:0.08em">{_regime_name}</span>
+        <span style="color:#e0e0e0;font-size:13px">{_conf_str}</span>
+        <span style="color:#888;font-size:13px">{_psm_str}</span>
+        {_ind_html}
+      </div>
+      <div style="text-align:right">{_ts_str}</div>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    # regime.json missing or regime key unrecognised
+    st.markdown("""
+    <div style="background:#111111;border:1px solid #2a2a2a;border-radius:8px;
+                padding:12px 18px;display:flex;align-items:center;gap:16px;margin-bottom:8px">
+      <span style="background:#1e1e1e;color:#666;border:1px solid #33333366;
+                   border-radius:6px;padding:4px 14px;font-size:15px;
+                   font-weight:800;letter-spacing:0.08em">UNKNOWN</span>
+      <span style="color:#555;font-size:13px">Run pipeline to classify regime</span>
+    </div>
+    """, unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Auto-refresh via meta tag injection
