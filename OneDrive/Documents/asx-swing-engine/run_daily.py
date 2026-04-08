@@ -30,6 +30,7 @@ Usage:
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -67,12 +68,13 @@ from utils.emailer import send_email
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ASX Swing Engine - daily run")
-    p.add_argument("--no-charts",    action="store_true", help="Skip chart generation")
-    p.add_argument("--no-email",     action="store_true", help="Skip sending email")
-    p.add_argument("--no-signals",   action="store_true", help="Skip signal scanner")
-    p.add_argument("--no-ibkr",      action="store_true", help="Skip IBKR order submission")
-    p.add_argument("--ibkr-dry-run", action="store_true", help="IBKR dry-run: print orders, do not submit")
-    p.add_argument("--top-n",        type=int, default=10, help="Charts for top N (default 10)")
+    p.add_argument("--no-charts",       action="store_true", help="Skip chart generation")
+    p.add_argument("--no-email",        action="store_true", help="Skip sending email")
+    p.add_argument("--no-signals",      action="store_true", help="Skip signal scanner")
+    p.add_argument("--no-ibkr",         action="store_true", help="Skip IBKR order submission")
+    p.add_argument("--ibkr-dry-run",    action="store_true", help="IBKR dry-run: print orders, do not submit")
+    p.add_argument("--no-exit-logger",  action="store_true", help="Skip launching exit_logger in background")
+    p.add_argument("--top-n",           type=int, default=10, help="Charts for top N (default 10)")
     return p.parse_args()
 
 
@@ -190,6 +192,58 @@ def main() -> None:
             except Exception as exc:
                 log.error("IBKR executor failed: %s", exc, exc_info=True)
                 # Non-fatal - pipeline still completes
+
+    # ── 6. Exit logger (background) ───────────────────────────────────────────
+    if args.no_exit_logger:
+        log.info("Step 6/6 - Exit logger skipped (--no-exit-logger).")
+    else:
+        log.info("Step 6/6 - Starting exit logger in background ...")
+        try:
+            pid_file = Path("logs/exit_logger.pid")
+
+            # Check if already running via PID file
+            already_up = False
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    if sys.platform == "win32":
+                        import ctypes
+                        handle = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)
+                        if handle:
+                            ctypes.windll.kernel32.CloseHandle(handle)
+                            already_up = True
+                    else:
+                        os.kill(pid, 0)
+                        already_up = True
+                except (ValueError, OSError, ProcessLookupError):
+                    pass
+
+            if already_up:
+                log.info("Exit logger already running (PID %s) - skipping launch.", pid)
+            else:
+                el_log = open(
+                    log_dir / f"exit_logger_{datetime.today().strftime('%Y%m%d_%H%M%S')}.log",
+                    "a", encoding="utf-8",
+                )
+                kwargs = dict(
+                    args=[sys.executable, "exit_logger.py"],
+                    stdout=el_log,
+                    stderr=subprocess.STDOUT,
+                    cwd=Path(__file__).parent,
+                )
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = (
+                        subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                    )
+                else:
+                    kwargs["start_new_session"] = True
+
+                proc = subprocess.Popen(**kwargs)
+                log.info("Exit logger launched  PID=%d  log -> %s", proc.pid, el_log.name)
+
+        except Exception as exc:
+            log.error("Failed to launch exit logger: %s", exc, exc_info=True)
+            # Non-fatal — pipeline still completes
 
     log.info("=" * 62)
     log.info("  Daily run complete.  Log -> %s", log_file)

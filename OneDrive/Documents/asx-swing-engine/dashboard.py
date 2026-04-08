@@ -21,6 +21,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import yfinance as yf
+import plotly.graph_objects as go
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -93,8 +94,10 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 SIGNALS_CSV   = Path("results/signals_output.csv")
 TRADES_CSV    = Path("logs/trades.csv")
+EQUITY_CSV    = Path("results/equity_curve.csv")
 SCREENER_CSV  = Path("results/screener_output.csv")
 REFRESH_SECS  = 300   # 5 minutes
+STARTING_BALANCE = 20_000.0
 
 GREEN = "#26a69a"
 RED   = "#ef5350"
@@ -156,6 +159,28 @@ def _load_trades() -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.read_csv(TRADES_CSV, parse_dates=["timestamp"])
     return df
+
+
+@st.cache_data(ttl=REFRESH_SECS)
+def _load_equity() -> pd.DataFrame:
+    """Load live closed trades from results/equity_curve.csv."""
+    if not EQUITY_CSV.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(EQUITY_CSV, parse_dates=["date"])
+    return df
+
+
+@st.cache_data(ttl=REFRESH_SECS)
+def _load_backtest_equity() -> pd.Series:
+    """Load the most recent backtest equity curve as a normalised series."""
+    if not Path("results/backtest").exists():
+        return pd.Series(dtype=float)
+    eq_files = sorted(Path("results/backtest").glob("equity_rs_top_20pct_*.csv"))
+    if not eq_files:
+        return pd.Series(dtype=float)
+    eq = pd.read_csv(eq_files[-1], index_col=0, parse_dates=True)
+    col = "mark_to_market" if "mark_to_market" in eq.columns else eq.columns[0]
+    return eq[col].dropna()
 
 
 @st.cache_data(ttl=REFRESH_SECS)
@@ -355,85 +380,177 @@ else:
 st.markdown("---")
 
 # ---------------------------------------------------------------------------
-# 3. Performance summary  +  4. Equity curve   (side by side)
+# 3. Live P&L  (full width)
 # ---------------------------------------------------------------------------
-col_perf, col_eq = st.columns([1, 2], gap="large")
+st.markdown("## Live P&amp;L")
 
-with col_perf:
-    st.markdown("## Performance")
+equity_df    = _load_equity()
+bt_equity    = _load_backtest_equity()
 
-    if trades_raw.empty:
-        st.info("No trade data yet.")
-    else:
-        df = trades_raw.copy()
+# ── summary metrics ─────────────────────────────────────────────────────────
+has_closed = not equity_df.empty
 
-        # Deduplicate: one entry per order_ref (last row wins)
-        df = df.sort_values("timestamp").drop_duplicates("order_ref", keep="last")
+if has_closed:
+    current_balance = float(equity_df["account_balance"].iloc[-1])
+    total_return    = (current_balance / STARTING_BALANCE - 1) * 100
+    n_closed        = len(equity_df)
+    n_wins          = int((equity_df["pnl_aud"] > 0).sum())
+    win_rate        = n_wins / n_closed * 100 if n_closed else 0.0
+else:
+    current_balance = STARTING_BALANCE
+    total_return    = 0.0
+    n_closed        = 0
+    win_rate        = 0.0
 
-        # We don't have exit prices in trades.csv (executor logs entries only).
-        # Use risk_aud as a proxy: each closed win = +2R, loss = -1R for now.
-        # When a proper exit log is added this section will auto-update.
-        n_trades  = len(df)
-        n_paper   = int(df["paper"].sum()) if "paper" in df.columns else n_trades
-        total_risk = df["risk_aud"].sum()
-        avg_score  = df["composite_score"].mean()
+bal_c = _colour(total_return)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Account Balance",  f"${current_balance:,.0f}",
+          delta=f"{_fmt_aud(current_balance - STARTING_BALANCE)}" if has_closed else None)
+m2.metric("Total Return",     f"{total_return:+.2f}%",
+          delta=f"{total_return:+.2f}%" if has_closed else None)
+m3.metric("Closed Trades",    str(n_closed))
+m4.metric("Win Rate",         f"{win_rate:.0f}%" if has_closed else "—")
 
-        # Summary metrics
-        m1, m2 = st.columns(2)
-        m1.metric("Positions logged", n_trades)
-        m2.metric("Paper trades", n_paper)
+# ── build Plotly figure ──────────────────────────────────────────────────────
+fig = go.Figure()
 
-        m3, m4 = st.columns(2)
-        m3.metric("Total risk deployed", f"${total_risk:,.0f}")
-        m4.metric("Avg signal score", f"{avg_score:.1f}")
+# 1. Backtest equity curve — faded background line
+if not bt_equity.empty:
+    bt_start = float(bt_equity.iloc[0])
+    # Normalise backtest to same $20k starting balance
+    bt_normalised = bt_equity * (STARTING_BALANCE / bt_start)
+    fig.add_trace(go.Scatter(
+        x=bt_normalised.index,
+        y=bt_normalised.values,
+        mode="lines",
+        name="Backtest",
+        line=dict(color="rgba(100,100,120,0.35)", width=1.5, dash="solid"),
+        hovertemplate="Backtest: $%{y:,.0f}<br>%{x|%d %b %Y}<extra></extra>",
+    ))
 
-        st.markdown(
-            "<p style='color:#555;font-size:11px;margin-top:12px'>"
-            "P&amp;L metrics will populate once exit logging is wired in."
-            "</p>",
-            unsafe_allow_html=True,
-        )
+# 2. Horizontal dashed baseline at $20,000
+fig.add_hline(
+    y=STARTING_BALANCE,
+    line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dash"),
+    annotation_text="$20,000 start",
+    annotation_position="bottom right",
+    annotation_font=dict(color="#555555", size=11),
+)
 
-with col_eq:
-    st.markdown("## Equity Curve")
+# 3. Live equity line + trade dots
+if has_closed:
+    # Prepend the starting point so line starts at $20k
+    live_dates    = [equity_df["date"].iloc[0]] + equity_df["date"].tolist()
+    live_balances = [STARTING_BALANCE] + equity_df["account_balance"].tolist()
 
-    # Look for the most recent equity CSV in results/backtest/
-    eq_files = sorted(Path("results/backtest").glob("equity_rs_top_20pct_*.csv")) if \
-               Path("results/backtest").exists() else []
+    fig.add_trace(go.Scatter(
+        x=live_dates,
+        y=live_balances,
+        mode="lines",
+        name="Live account",
+        line=dict(color=GREEN, width=2),
+        hovertemplate="Live: $%{y:,.0f}<br>%{x|%d %b %Y}<extra></extra>",
+    ))
 
-    if not eq_files:
-        st.info("No equity curve data found. Run python backtest.py to generate one.")
-    else:
-        eq_path = eq_files[-1]
-        eq = pd.read_csv(eq_path, index_col=0, parse_dates=True)
-        eq_col = "mark_to_market" if "mark_to_market" in eq.columns else eq.columns[0]
-        eq_series = eq[eq_col].dropna()
+    # Trade dots — green winners, red losers
+    winners = equity_df[equity_df["pnl_aud"] > 0]
+    losers  = equity_df[equity_df["pnl_aud"] <= 0]
 
-        # Build chart dataframe
-        chart_df = eq_series.rename("Account ($AUD)").reset_index()
-        chart_df.columns = ["Date", "Account ($AUD)"]
+    for subset, colour, label in [
+        (winners, GREEN, "Win"),
+        (losers,  RED,   "Loss"),
+    ]:
+        if not subset.empty:
+            fig.add_trace(go.Scatter(
+                x=subset["date"],
+                y=subset["account_balance"],
+                mode="markers",
+                name=label,
+                marker=dict(color=colour, size=9, line=dict(color="#0d0d0d", width=1.5)),
+                customdata=subset[["ticker", "pnl_aud", "exit_type"]].values,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b>  %{customdata[2]}<br>"
+                    "P&L: $%{customdata[1]:,.2f}<br>"
+                    "Balance: $%{y:,.0f}<br>"
+                    "%{x|%d %b %Y}<extra></extra>"
+                ),
+            ))
+else:
+    # No closed trades yet — flat line at $20k
+    from datetime import timedelta
+    today = datetime.now().date()
+    flat_dates = [today, today + timedelta(days=30)]
+    fig.add_trace(go.Scatter(
+        x=flat_dates,
+        y=[STARTING_BALANCE, STARTING_BALANCE],
+        mode="lines",
+        name="Live account",
+        line=dict(color=GREEN, width=2),
+        hoverinfo="skip",
+    ))
+    fig.add_annotation(
+        x=flat_dates[0], y=STARTING_BALANCE,
+        text="Waiting for first closed trade",
+        showarrow=False,
+        font=dict(color="#555555", size=12),
+        xanchor="left",
+        yanchor="bottom",
+        yshift=12,
+    )
 
-        start = float(eq_series.iloc[0])
-        end   = float(eq_series.iloc[-1])
-        ret   = (end / start - 1) * 100
+# ── layout ───────────────────────────────────────────────────────────────────
+fig.update_layout(
+    height=380,
+    paper_bgcolor="#0d0d0d",
+    plot_bgcolor="#0d0d0d",
+    font=dict(color="#888888", size=11),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom", y=1.01,
+        xanchor="left",   x=0,
+        font=dict(size=11),
+        bgcolor="rgba(0,0,0,0)",
+    ),
+    margin=dict(l=60, r=20, t=10, b=40),
+    xaxis=dict(
+        gridcolor="#1e1e1e",
+        linecolor="#2a2a2a",
+        tickformat="%d %b %Y",
+        showgrid=True,
+    ),
+    yaxis=dict(
+        gridcolor="#1e1e1e",
+        linecolor="#2a2a2a",
+        tickprefix="$",
+        tickformat=",.0f",
+        showgrid=True,
+    ),
+    hovermode="x unified",
+)
 
-        ret_c = _colour(ret)
-        st.markdown(
-            f"<p style='color:#888;font-size:12px;margin:0 0 8px'>"
-            f"5-year backtest  &nbsp;·&nbsp;  "
-            f"${start:,.0f} &rarr; "
-            f"<strong style='color:{ret_c}'>${end:,.0f}</strong>  "
-            f"(<span style='color:{ret_c}'>{ret:+.1f}%</span>)"
-            f"</p>",
-            unsafe_allow_html=True,
-        )
+st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-        st.line_chart(
-            chart_df.set_index("Date"),
-            color=GREEN,
-            use_container_width=True,
-            height=260,
-        )
+st.markdown("---")
+
+# ---------------------------------------------------------------------------
+# 4. Performance summary
+# ---------------------------------------------------------------------------
+st.markdown("## Performance")
+
+if trades_raw.empty:
+    st.info("No trade data yet.")
+else:
+    df = trades_raw.copy().sort_values("timestamp").drop_duplicates("order_ref", keep="last")
+    n_trades   = len(df)
+    n_paper    = int(df["paper"].sum()) if "paper" in df.columns else n_trades
+    total_risk = df["risk_aud"].sum()
+    avg_score  = df["composite_score"].mean()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Positions open/logged", n_trades)
+    m2.metric("Paper trades", n_paper)
+    m3.metric("Total risk deployed", f"${total_risk:,.0f}")
+    m4.metric("Avg signal score", f"{avg_score:.1f}")
 
 st.markdown("---")
 
