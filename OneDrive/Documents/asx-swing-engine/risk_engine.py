@@ -7,21 +7,27 @@ Reads:
     results/signals_output.csv   — raw signals from signals.py
     results/regime.json          — position_size_multiplier + regime
     logs/trades.csv              — open bracket orders for exposure/heat
+    results/screener_output.csv  — sector data for concentration cap
+    results/sector_cache.json    — persistent sector cache (auto-populated)
 
 Writes:
     results/signals_final.csv    — adjusted, gated signals for ibkr_executor
+    results/sector_cache.json    — updated sector cache after any yfinance lookups
 
-Three checks, applied in order:
+Six checks applied per signal (after portfolio-level gates pass):
 
-  1. EXPOSURE GATE   — if >= MAX_POSITIONS already open, block all new orders.
-  2. HEAT CHECK      — if open risk >= HEAT_LIMIT_PCT of account, reduce or
-                       block new position sizes so total heat stays under the cap.
-  3. PSM SCALING     — multiply every position's risk by the regime
-                       position_size_multiplier (e.g. 0.75 for WEAK_BULL).
+  1. EXPOSURE GATE      — if >= MAX_POSITIONS already open, block all new orders.
+  2. HEAT CHECK         — if open risk >= HEAT_LIMIT_PCT, scale or block new sizes.
+  3. PSM SCALING        — multiply per-trade risk by regime position_size_multiplier.
+  4. SCORE RANKING      — signals sorted by composite_score desc before slot trimming.
+  5. MIN RISK FLOOR     — skip any trade where final risk < MIN_RISK_AUD ($75).
+  6. SECTOR CAP         — skip if the same GICS sector already has >= SECTOR_CAP (2)
+                          open positions.  Unknown sectors are not capped.
 
-Output column added to signals_final.csv:
-    risk_multiplier  — float 0.0–1.0; ibkr_executor multiplies base risk by this.
+Output columns added to signals_final.csv:
+    risk_multiplier   — float; ibkr_executor multiplies base risk by this.
     adjusted_risk_aud — pre-computed dollar risk for the position.
+    sector            — GICS sector string used for concentration check.
 
 Usage:
     python risk_engine.py                  # run standalone
@@ -54,10 +60,14 @@ MIN_SHARES        = 1              # minimum viable share parcel
 
 ACCOUNT_BALANCE   = float(os.getenv("PAPER_BALANCE_OVERRIDE", "20000"))
 
+MIN_RISK_AUD      = 75.0           # skip trades below this dollar risk
+SECTOR_CAP        = 2              # max open positions per GICS sector
+
 SIGNALS_CSV       = Path("results/signals_output.csv")
 FINAL_CSV         = Path("results/signals_final.csv")
 REGIME_JSON       = Path("results/regime.json")
 TRADES_CSV        = Path("logs/trades.csv")
+SECTOR_CACHE      = Path("results/sector_cache.json")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -136,6 +146,47 @@ def _write_empty(reason: str, dry_run: bool) -> None:
         pd.DataFrame().to_csv(FINAL_CSV, index=False)
 
 
+def _load_sectors(tickers: list[str]) -> dict[str, str]:
+    """
+    Return {ticker: sector_string} for the given list.
+
+    Reads SECTOR_CACHE first; fetches missing tickers from yfinance
+    (yf.Ticker().info['sector']) and persists results back to cache.
+    Tickers whose sector cannot be determined are stored as 'Unknown'.
+    """
+    # Load existing cache
+    cache: dict[str, str] = {}
+    if SECTOR_CACHE.exists():
+        try:
+            with open(SECTOR_CACHE) as fh:
+                cache = json.load(fh)
+        except Exception as exc:
+            log.warning("Could not read sector cache (%s) — starting fresh.", exc)
+
+    missing = [t for t in tickers if t not in cache]
+    if missing:
+        log.info("Fetching sector for %d uncached ticker(s) via yfinance ...", len(missing))
+        for ticker in missing:
+            try:
+                import yfinance as yf
+                info   = yf.Ticker(ticker).info
+                sector = info.get("sector") or "Unknown"
+            except Exception:
+                sector = "Unknown"
+            cache[ticker] = sector
+            log.info("  %-12s  sector=%s", ticker, sector)
+
+        # Persist updated cache
+        try:
+            SECTOR_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            with open(SECTOR_CACHE, "w") as fh:
+                json.dump(cache, fh, indent=2)
+        except Exception as exc:
+            log.warning("Could not save sector cache: %s", exc)
+
+    return {t: cache.get(t, "Unknown") for t in tickers}
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -153,6 +204,8 @@ def run_risk_engine(dry_run: bool = False) -> dict:
     summary = {
         "signals_in":        0,
         "signals_out":       0,
+        "skipped_floor":     0,
+        "skipped_sector":    0,
         "n_open":            0,
         "slots_available":   0,
         "current_heat_pct":  0.0,
@@ -289,41 +342,109 @@ def run_risk_engine(dry_run: bool = False) -> dict:
         summary["block_reason"] = "final risk < $1 after adjustments"
         return summary
 
-    # ── 6. Trim to available slots + annotate ─────────────────────────────────
-    signals_out = signals.head(n_new).copy()
-    signals_out["risk_multiplier"]   = risk_multiplier
-    signals_out["adjusted_risk_aud"] = round(final_risk_aud, 2)
-    signals_out["regime"]            = regime
-    signals_out["psm"]               = psm
+    # ── 6. Sort by composite_score desc (best signals first) ─────────────────
+    if "composite_score" in signals.columns:
+        signals = signals.sort_values("composite_score", ascending=False)
+    log.info("Signals ranked by composite_score (highest first).")
 
+    # ── 7. Build sector counts from open positions ────────────────────────────
+    open_tickers: list[str] = []
+    if not open_trades.empty and "ticker" in open_trades.columns:
+        open_tickers = open_trades["ticker"].tolist()
+
+    # Gather all tickers we need sectors for (open + candidates)
+    candidate_tickers = signals["ticker"].tolist() if "ticker" in signals.columns else []
+    all_need_sectors  = list(set(open_tickers + candidate_tickers))
+    sector_map        = _load_sectors(all_need_sectors)
+
+    # Count open positions per sector (skip Unknown)
+    sector_open_count: dict[str, int] = {}
+    for t in open_tickers:
+        sec = sector_map.get(t, "Unknown")
+        if sec != "Unknown":
+            sector_open_count[sec] = sector_open_count.get(sec, 0) + 1
+
+    log.info("Open sector counts: %s", sector_open_count if sector_open_count else "none")
+
+    # ── 8. Per-signal filtering: floor + sector cap + slot limit ──────────────
+    approved: list[pd.Series] = []
+    skipped_floor:  list[str] = []
+    skipped_sector: list[str] = []
+    skipped_slots:  list[str] = []
+    sector_session: dict[str, int] = dict(sector_open_count)  # mutable copy
+
+    for rank, row in signals.iterrows():
+        if len(approved) >= slots_available:
+            ticker = str(row.get("ticker", "???"))
+            skipped_slots.append(ticker)
+            continue
+
+        ticker = str(row.get("ticker", "???"))
+
+        # Min risk floor
+        if final_risk_aud < MIN_RISK_AUD:
+            log.info("  SKIP %-6s — risk $%.0f < floor $%.0f",
+                     ticker.replace(".AX", ""), final_risk_aud, MIN_RISK_AUD)
+            skipped_floor.append(ticker)
+            continue
+
+        # Sector cap
+        sector = sector_map.get(ticker, "Unknown")
+        if sector != "Unknown" and sector_session.get(sector, 0) >= SECTOR_CAP:
+            log.info("  SKIP %-6s — sector '%s' already has %d/%d open",
+                     ticker.replace(".AX", ""), sector,
+                     sector_session[sector], SECTOR_CAP)
+            skipped_sector.append(ticker)
+            continue
+
+        # Passed — approve
+        row = row.copy()
+        row["risk_multiplier"]   = risk_multiplier
+        row["adjusted_risk_aud"] = round(final_risk_aud, 2)
+        row["regime"]            = regime
+        row["psm"]               = psm
+        row["sector"]            = sector
+        approved.append(row)
+
+        # Update sector count for this session
+        if sector != "Unknown":
+            sector_session[sector] = sector_session.get(sector, 0) + 1
+
+    signals_out = pd.DataFrame(approved)
     summary["signals_out"] = len(signals_out)
 
-    # ── 7. Log the decision for each signal ───────────────────────────────────
+    # ── 9. Log the decision for each approved signal ──────────────────────────
     log.info("--- Approved signals (%d) ---", len(signals_out))
-    for rank, row in signals_out.iterrows():
+    for _, row in signals_out.iterrows():
         ticker = str(row.get("ticker", "???"))
         entry  = float(row.get("entry", 0))
         sl     = float(row.get("stop_loss", 0))
         tgt    = float(row.get("target", 0))
+        sector = str(row.get("sector", "Unknown"))
         rps    = entry - sl
         shares = int(final_risk_aud / rps) if rps > 0 else 0
         log.info(
-            "  #%-2s  %-6s  entry=%.3f  stop=%.3f  target=%.3f  "
-            "risk=$%.0f  shares≈%d  mult=%.2f",
-            rank,
+            "  ✓  %-6s  entry=%.3f  stop=%.3f  target=%.3f  "
+            "risk=$%.0f  shares≈%d  mult=%.2f  sector=%s",
             ticker.replace(".AX", ""),
             entry, sl, tgt,
-            final_risk_aud, shares, risk_multiplier,
+            final_risk_aud, shares, risk_multiplier, sector,
         )
 
-    blocked_count = summary["signals_in"] - len(signals_out)
-    if blocked_count > 0:
-        log.info(
-            "  … %d signal(s) dropped (only %d slot(s) available)",
-            blocked_count, slots_available,
-        )
+    if skipped_floor:
+        log.info("  FLOOR skip (%d): %s", len(skipped_floor),
+                 ", ".join(t.replace(".AX", "") for t in skipped_floor))
+    if skipped_sector:
+        log.info("  SECTOR skip (%d): %s", len(skipped_sector),
+                 ", ".join(t.replace(".AX", "") for t in skipped_sector))
+    if skipped_slots:
+        log.info("  SLOTS skip (%d): %s", len(skipped_slots),
+                 ", ".join(t.replace(".AX", "") for t in skipped_slots))
 
-    # ── 8. Write output ───────────────────────────────────────────────────────
+    summary["skipped_floor"]  = len(skipped_floor)
+    summary["skipped_sector"] = len(skipped_sector)
+
+    # ── 10. Write output ──────────────────────────────────────────────────────
     _write_final(signals_out, dry_run)
 
     log.info("=" * 60)
