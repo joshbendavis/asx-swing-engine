@@ -63,7 +63,7 @@ MIN_TRIGGERS     = 2                    # only trade signals with >= N triggers
 #   PAPER_BALANCE_OVERRIDE=20000
 PAPER_BALANCE_OVERRIDE = os.getenv("PAPER_BALANCE_OVERRIDE", "").strip()
 
-SIGNALS_CSV      = Path("results/signals_output.csv")
+SIGNALS_CSV      = Path("results/signals_final.csv")    # written by risk_engine.py
 TRADE_LOG        = Path("logs/trades.csv")
 
 CONNECT_TIMEOUT  = 10                   # seconds to wait for TWS connection
@@ -395,8 +395,10 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
             log.warning("%-6s: invalid risk_per_share (entry=%.3f stop=%.3f) - skipping.", symbol, entry, stop_loss)
             continue
 
-        # Position size
-        risk_aud = balance * RISK_PCT
+        # Position size — use risk_multiplier from risk_engine if present
+        risk_multiplier = float(row.get("risk_multiplier", 1.0)) \
+                          if "risk_multiplier" in row.index else 1.0
+        risk_aud = balance * RISK_PCT * risk_multiplier
         shares   = int(math.floor(risk_aud / risk_per_shr))
 
         if shares < MIN_SHARES:
@@ -415,8 +417,9 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
 
         log.info(
             "%-6s | shares=%-4d | entry=%.3f | stop=%.3f | target=%.3f | "
-            "risk=$%.2f | triggers=%d | score=%.1f",
-            symbol, shares, entry, stop_loss, target, risk_aud, t_count, score,
+            "risk=$%.2f (×%.2f) | triggers=%d | score=%.1f",
+            symbol, shares, entry, stop_loss, target,
+            risk_aud, risk_multiplier, t_count, score,
         )
 
         if dry_run:

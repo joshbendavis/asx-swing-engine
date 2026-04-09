@@ -4,11 +4,14 @@ run_daily.py
 Daily orchestrator for the ASX Swing Trade Engine.
 
 Pipeline:
-    1. Run screener   -> results/screener_output.csv
-    2. Run signals    -> results/signals_output.csv
-    3. Generate charts for top 10 -> results/charts/YYYYMMDD/
-    4. Send HTML email with results table + inline charts
-    5. Submit bracket orders to IBKR TWS via ibkr_executor.py
+    0. Regime detector -> results/regime.json
+    1. Screener        -> results/screener_output.csv
+    2. Signals         -> results/signals_output.csv
+    3. Risk engine     -> results/signals_final.csv
+    4. Charts          -> results/charts/YYYYMMDD/
+    5. Email
+    6. IBKR execution  <- reads signals_final.csv
+    7. Exit logger     (background process)
 
 Credentials are read from .env (copy .env.example -> .env and fill in):
     EMAIL_FROM          your email address
@@ -60,6 +63,7 @@ log = logging.getLogger("asx-swing")
 from regime_detector import run_regime_detector
 from screener import run_screener
 from signals import run_signals
+from risk_engine import run_risk_engine
 from ibkr_executor import run_executor as ibkr_run
 from utils.charts import generate_charts
 from utils.emailer import send_email
@@ -69,13 +73,14 @@ from utils.emailer import send_email
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ASX Swing Engine - daily run")
-    p.add_argument("--no-charts",       action="store_true", help="Skip chart generation")
-    p.add_argument("--no-email",        action="store_true", help="Skip sending email")
-    p.add_argument("--no-signals",      action="store_true", help="Skip signal scanner")
-    p.add_argument("--no-ibkr",         action="store_true", help="Skip IBKR order submission")
-    p.add_argument("--ibkr-dry-run",    action="store_true", help="IBKR dry-run: print orders, do not submit")
-    p.add_argument("--no-exit-logger",  action="store_true", help="Skip launching exit_logger in background")
-    p.add_argument("--top-n",           type=int, default=10, help="Charts for top N (default 10)")
+    p.add_argument("--no-charts",        action="store_true", help="Skip chart generation")
+    p.add_argument("--no-email",         action="store_true", help="Skip sending email")
+    p.add_argument("--no-signals",       action="store_true", help="Skip signal scanner")
+    p.add_argument("--no-risk-engine",   action="store_true", help="Skip risk engine (use signals_output.csv directly)")
+    p.add_argument("--no-ibkr",          action="store_true", help="Skip IBKR order submission")
+    p.add_argument("--ibkr-dry-run",     action="store_true", help="IBKR dry-run: print orders, do not submit")
+    p.add_argument("--no-exit-logger",   action="store_true", help="Skip launching exit_logger in background")
+    p.add_argument("--top-n",            type=int, default=10, help="Charts for top N (default 10)")
     return p.parse_args()
 
 
@@ -87,7 +92,7 @@ def main() -> None:
     log.info("=" * 62)
 
     # ── 0. Regime detector ────────────────────────────────────────────────────
-    log.info("Step 0/6 - Detecting market regime ...")
+    log.info("Step 0/7 - Detecting market regime ...")
     try:
         regime_result = run_regime_detector()
         regime        = regime_result["regime"]
@@ -110,7 +115,7 @@ def main() -> None:
         # signals.py will fall back to BULL defaults automatically.
 
     # ── 1. Screener ───────────────────────────────────────────────────────────
-    log.info("Step 1/6 - Running screener ...")
+    log.info("Step 1/7 - Running screener ...")
     try:
         results = run_screener()
     except Exception as exc:
@@ -136,7 +141,7 @@ def main() -> None:
 
     # ── 2. Signals ────────────────────────────────────────────────────────────
     if not args.no_signals:
-        log.info("Step 2/6 - Running signal scanner ...")
+        log.info("Step 2/7 - Running signal scanner ...")
         try:
             signals = run_signals()
             if signals.empty:
@@ -151,13 +156,39 @@ def main() -> None:
             log.error("Signal scanner failed: %s", exc, exc_info=True)
             # Non-fatal - continue to charts and email
     else:
-        log.info("Step 2/6 - Signals skipped (--no-signals).")
+        log.info("Step 2/7 - Signals skipped (--no-signals).")
 
-    # ── 3. Charts ─────────────────────────────────────────────────────────────
+    # ── 3. Risk engine ────────────────────────────────────────────────────────
+    if args.no_risk_engine:
+        log.info("Step 3/7 - Risk engine skipped (--no-risk-engine).")
+        log.info("          ibkr_executor will use signals_output.csv directly.")
+    else:
+        log.info("Step 3/7 - Running risk engine ...")
+        try:
+            risk_summary = run_risk_engine()
+            if risk_summary["blocked"]:
+                log.warning(
+                    "Risk engine BLOCKED all orders: %s", risk_summary["block_reason"]
+                )
+            else:
+                log.info(
+                    "Risk engine approved: %d/%d signal(s)  |  "
+                    "heat=%.1f%%  |  risk_multiplier=%.2f  |  slots=%d",
+                    risk_summary["signals_out"],
+                    risk_summary["signals_in"],
+                    risk_summary["current_heat_pct"],
+                    risk_summary["risk_multiplier"],
+                    risk_summary["slots_available"],
+                )
+        except Exception as exc:
+            log.error("Risk engine failed: %s", exc, exc_info=True)
+            # Non-fatal — IBKR step will still run with whatever signals_final.csv contains
+
+    # ── 4. Charts ─────────────────────────────────────────────────────────────
     chart_paths: list[tuple[str, str]] = []
 
     if not args.no_charts:
-        log.info("Step 3/6 - Generating charts for top %d ...", args.top_n)
+        log.info("Step 4/7 - Generating charts for top %d ...", args.top_n)
         try:
             chart_paths = generate_charts(results, top_n=args.top_n)
             log.info("Generated %d chart(s).", len(chart_paths))
@@ -165,11 +196,11 @@ def main() -> None:
             log.error("Chart generation failed: %s", exc, exc_info=True)
             # Non-fatal - continue to email with no charts
     else:
-        log.info("Step 3/6 - Charts skipped (--no-charts).")
+        log.info("Step 4/7 - Charts skipped (--no-charts).")
 
     # ── 4. Email ──────────────────────────────────────────────────────────────
     if not args.no_email:
-        log.info("Step 4/6 - Sending email ...")
+        log.info("Step 5/7 - Sending email ...")
 
         email_from = os.getenv("EMAIL_FROM", "").strip()
         email_pass = os.getenv("EMAIL_PASSWORD", "").strip()
@@ -197,19 +228,25 @@ def main() -> None:
             except Exception as exc:
                 log.error("Email failed: %s", exc, exc_info=True)
     else:
-        log.info("Step 4/6 - Email skipped (--no-email).")
+        log.info("Step 5/7 - Email skipped (--no-email).")
 
     # ── 5. IBKR order submission ───────────────────────────────────────────────
     if args.no_ibkr:
-        log.info("Step 5/6 - IBKR skipped (--no-ibkr).")
+        log.info("Step 6/7 - IBKR skipped (--no-ibkr).")
     else:
-        sig_path = Path("results") / "signals_output.csv"
+        # Prefer risk-engine output; fall back to raw signals if risk engine was skipped
+        sig_path = Path("results") / "signals_final.csv"
         if not sig_path.exists():
-            log.warning("Step 5/6 - signals_output.csv not found, skipping IBKR.")
+            sig_path = Path("results") / "signals_output.csv"
+            log.warning(
+                "Step 6/7 - signals_final.csv not found, falling back to signals_output.csv."
+            )
+        if not sig_path.exists():
+            log.warning("Step 6/7 - no signals file found, skipping IBKR.")
         else:
             dry = args.ibkr_dry_run
             mode_label = "DRY-RUN" if dry else "LIVE SUBMIT"
-            log.info("Step 5/6 - IBKR order submission [%s] ...", mode_label)
+            log.info("Step 6/7 - IBKR order submission [%s] ...", mode_label)
             try:
                 n = ibkr_run(sig_path, dry_run=dry)
                 log.info("IBKR: %d bracket order(s) submitted.", n)
@@ -219,9 +256,9 @@ def main() -> None:
 
     # ── 6. Exit logger (background) ───────────────────────────────────────────
     if args.no_exit_logger:
-        log.info("Step 6/6 - Exit logger skipped (--no-exit-logger).")
+        log.info("Step 7/7 - Exit logger skipped (--no-exit-logger).")
     else:
-        log.info("Step 6/6 - Starting exit logger in background ...")
+        log.info("Step 7/7 - Starting exit logger in background ...")
         try:
             pid_file = Path("logs/exit_logger.pid")
 

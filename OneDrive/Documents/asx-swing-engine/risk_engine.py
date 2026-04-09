@@ -1,0 +1,349 @@
+"""
+risk_engine.py
+--------------
+Portfolio-level risk gate that sits between signal generation and IBKR execution.
+
+Reads:
+    results/signals_output.csv   — raw signals from signals.py
+    results/regime.json          — position_size_multiplier + regime
+    logs/trades.csv              — open bracket orders for exposure/heat
+
+Writes:
+    results/signals_final.csv    — adjusted, gated signals for ibkr_executor
+
+Three checks, applied in order:
+
+  1. EXPOSURE GATE   — if >= MAX_POSITIONS already open, block all new orders.
+  2. HEAT CHECK      — if open risk >= HEAT_LIMIT_PCT of account, reduce or
+                       block new position sizes so total heat stays under the cap.
+  3. PSM SCALING     — multiply every position's risk by the regime
+                       position_size_multiplier (e.g. 0.75 for WEAK_BULL).
+
+Output column added to signals_final.csv:
+    risk_multiplier  — float 0.0–1.0; ibkr_executor multiplies base risk by this.
+    adjusted_risk_aud — pre-computed dollar risk for the position.
+
+Usage:
+    python risk_engine.py                  # run standalone
+    python risk_engine.py --dry-run        # print decisions without writing CSV
+    from risk_engine import run_risk_engine
+    summary = run_risk_engine()
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Config  (mirror values from ibkr_executor.py)
+# ---------------------------------------------------------------------------
+RISK_PCT          = 0.015          # base risk per trade as fraction of account
+MAX_POSITIONS     = 6              # maximum concurrent open positions
+HEAT_LIMIT_PCT    = 9.0            # max portfolio heat % before scaling kicks in
+MIN_SHARES        = 1              # minimum viable share parcel
+
+ACCOUNT_BALANCE   = float(os.getenv("PAPER_BALANCE_OVERRIDE", "20000"))
+
+SIGNALS_CSV       = Path("results/signals_output.csv")
+FINAL_CSV         = Path("results/signals_final.csv")
+REGIME_JSON       = Path("results/regime.json")
+TRADES_CSV        = Path("logs/trades.csv")
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+log = logging.getLogger("risk-engine")
+if not log.handlers:
+    _h = logging.StreamHandler(sys.stdout)
+    _h.setFormatter(logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"
+    ))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _load_regime() -> dict:
+    """Load regime.json; return BULL defaults if missing."""
+    default = {"regime": "BULL", "position_size_multiplier": 1.0, "confidence": 100}
+    if not REGIME_JSON.exists():
+        log.warning("regime.json not found — using BULL defaults.")
+        return default
+    try:
+        with open(REGIME_JSON) as fh:
+            return json.load(fh)
+    except Exception as exc:
+        log.warning("Could not parse regime.json (%s) — using BULL defaults.", exc)
+        return default
+
+
+def _load_open_trades() -> pd.DataFrame:
+    """
+    Return the canonical open positions from logs/trades.csv.
+
+    A row is considered open when:
+      - tp_id > 0  (a valid bracket was submitted)
+      - exit_timestamp is NaN / missing  (not yet closed)
+
+    Deduplicates by order_ref, keeping the latest row.
+    """
+    if not TRADES_CSV.exists():
+        return pd.DataFrame()
+
+    df = pd.read_csv(TRADES_CSV, parse_dates=["timestamp"])
+
+    # Add exit columns if absent (old schema)
+    for col in ["exit_timestamp", "tp_id"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["tp_id"] = pd.to_numeric(df["tp_id"], errors="coerce").fillna(0)
+
+    # Only bracket orders that haven't closed
+    open_df = df[(df["tp_id"] > 0) & (df["exit_timestamp"].isna())].copy()
+    open_df = open_df.sort_values("timestamp").drop_duplicates("order_ref", keep="last")
+    return open_df.reset_index(drop=True)
+
+
+def _write_final(df: pd.DataFrame, dry_run: bool) -> None:
+    """Write (or log-only in dry-run) the final signals CSV."""
+    FINAL_CSV.parent.mkdir(parents=True, exist_ok=True)
+    if dry_run:
+        log.info("[DRY-RUN] Would write %d signal(s) to %s", len(df), FINAL_CSV)
+    else:
+        df.to_csv(FINAL_CSV, index=True)
+        log.info("signals_final.csv written -> %s  (%d signal(s))", FINAL_CSV, len(df))
+
+
+def _write_empty(reason: str, dry_run: bool) -> None:
+    """Write an empty signals_final.csv and log why."""
+    log.warning("BLOCKED: %s — writing empty signals_final.csv.", reason)
+    if not dry_run:
+        FINAL_CSV.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame().to_csv(FINAL_CSV, index=False)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def run_risk_engine(dry_run: bool = False) -> dict:
+    """
+    Apply portfolio risk gates and write results/signals_final.csv.
+
+    Returns a summary dict with all decisions made.
+    """
+    log.info("=" * 60)
+    log.info("  Risk Engine — %s", datetime.now().strftime("%d %b %Y %H:%M"))
+    log.info("=" * 60)
+
+    summary = {
+        "signals_in":        0,
+        "signals_out":       0,
+        "n_open":            0,
+        "slots_available":   0,
+        "current_heat_pct":  0.0,
+        "heat_budget_aud":   0.0,
+        "risk_multiplier":   1.0,
+        "psm":               1.0,
+        "regime":            "BULL",
+        "blocked":           False,
+        "block_reason":      None,
+    }
+
+    # ── 1. Load raw signals ───────────────────────────────────────────────────
+    if not SIGNALS_CSV.exists():
+        log.warning("signals_output.csv not found — nothing to process.")
+        _write_empty("no signals file", dry_run)
+        summary["blocked"] = True
+        summary["block_reason"] = "no signals file"
+        return summary
+
+    signals = pd.read_csv(SIGNALS_CSV, index_col=0)   # rank is the index
+    summary["signals_in"] = len(signals)
+    log.info("Signals loaded: %d candidate(s)", len(signals))
+
+    if signals.empty:
+        log.info("No signals today — nothing to gate.")
+        _write_empty("no signals", dry_run)
+        return summary
+
+    # ── 2. Load regime ────────────────────────────────────────────────────────
+    regime_data = _load_regime()
+    regime      = regime_data.get("regime", "BULL")
+    psm         = float(regime_data.get("position_size_multiplier", 1.0))
+    confidence  = regime_data.get("confidence", 100)
+    summary["regime"] = regime
+    summary["psm"]    = psm
+    log.info("Regime: %s  |  confidence=%s  |  PSM=%.2f", regime, confidence, psm)
+
+    # BEAR regime — no orders regardless
+    if regime == "BEAR":
+        _write_empty("BEAR regime", dry_run)
+        summary["blocked"] = True
+        summary["block_reason"] = "BEAR regime"
+        return summary
+
+    # PSM = 0 from confidence table — no trade
+    if psm == 0.0:
+        _write_empty(f"confidence too low ({confidence}) → PSM=0.0", dry_run)
+        summary["blocked"] = True
+        summary["block_reason"] = f"confidence {confidence} → PSM 0.0"
+        return summary
+
+    # ── 3. Exposure gate ──────────────────────────────────────────────────────
+    open_trades = _load_open_trades()
+    n_open      = len(open_trades)
+    summary["n_open"] = n_open
+    log.info(
+        "Open positions: %d / %d  (from %s)",
+        n_open, MAX_POSITIONS, TRADES_CSV,
+    )
+
+    if n_open >= MAX_POSITIONS:
+        _write_empty(
+            f"portfolio full ({n_open}/{MAX_POSITIONS} positions open)", dry_run
+        )
+        summary["blocked"]      = True
+        summary["block_reason"] = f"portfolio full ({n_open}/{MAX_POSITIONS})"
+        return summary
+
+    slots_available = MAX_POSITIONS - n_open
+    summary["slots_available"] = slots_available
+    log.info("Slots available: %d", slots_available)
+
+    # ── 4. Portfolio heat check ───────────────────────────────────────────────
+    base_risk_aud   = ACCOUNT_BALANCE * RISK_PCT   # $300 at default settings
+
+    if not open_trades.empty and "risk_aud" in open_trades.columns:
+        total_open_risk  = float(open_trades["risk_aud"].sum())
+    else:
+        total_open_risk  = 0.0
+
+    current_heat_pct = total_open_risk / ACCOUNT_BALANCE * 100
+    heat_remaining   = max(0.0, HEAT_LIMIT_PCT - current_heat_pct)
+    heat_budget_aud  = ACCOUNT_BALANCE * heat_remaining / 100
+
+    summary["current_heat_pct"] = round(current_heat_pct, 2)
+    summary["heat_budget_aud"]  = round(heat_budget_aud,  2)
+
+    log.info(
+        "Portfolio heat: %.1f%% used / %.1f%% limit  "
+        "(open risk $%.0f / account $%.0f)  |  budget remaining: $%.0f",
+        current_heat_pct, HEAT_LIMIT_PCT,
+        total_open_risk, ACCOUNT_BALANCE, heat_budget_aud,
+    )
+
+    if heat_budget_aud <= 0:
+        _write_empty(
+            f"heat limit reached ({current_heat_pct:.1f}% >= {HEAT_LIMIT_PCT}%)",
+            dry_run,
+        )
+        summary["blocked"]      = True
+        summary["block_reason"] = (
+            f"heat limit reached ({current_heat_pct:.1f}% >= {HEAT_LIMIT_PCT}%)"
+        )
+        return summary
+
+    # ── 5. Compute effective risk per trade ───────────────────────────────────
+    # Cap signals to available slots before dividing heat budget
+    n_new          = min(slots_available, len(signals))
+    heat_risk_cap  = heat_budget_aud / n_new       # fair share of remaining budget
+
+    # Take the tighter of base risk and heat cap
+    effective_risk = min(base_risk_aud, heat_risk_cap)
+
+    # Apply regime PSM
+    final_risk_aud = effective_risk * psm
+
+    # Express as a multiplier relative to the raw base (for ibkr_executor)
+    risk_multiplier = round(final_risk_aud / base_risk_aud, 4) if base_risk_aud > 0 else 0.0
+
+    summary["risk_multiplier"] = risk_multiplier
+
+    log.info(
+        "Sizing: base=$%.0f  heat_cap=$%.0f  effective=$%.0f  "
+        "× PSM(%.2f) → final=$%.0f  multiplier=%.4f",
+        base_risk_aud, heat_risk_cap, effective_risk, psm,
+        final_risk_aud, risk_multiplier,
+    )
+
+    if final_risk_aud < 1.0:
+        _write_empty(
+            f"final risk ${final_risk_aud:.2f} too small to place any trade", dry_run
+        )
+        summary["blocked"]      = True
+        summary["block_reason"] = "final risk < $1 after adjustments"
+        return summary
+
+    # ── 6. Trim to available slots + annotate ─────────────────────────────────
+    signals_out = signals.head(n_new).copy()
+    signals_out["risk_multiplier"]   = risk_multiplier
+    signals_out["adjusted_risk_aud"] = round(final_risk_aud, 2)
+    signals_out["regime"]            = regime
+    signals_out["psm"]               = psm
+
+    summary["signals_out"] = len(signals_out)
+
+    # ── 7. Log the decision for each signal ───────────────────────────────────
+    log.info("--- Approved signals (%d) ---", len(signals_out))
+    for rank, row in signals_out.iterrows():
+        ticker = str(row.get("ticker", "???"))
+        entry  = float(row.get("entry", 0))
+        sl     = float(row.get("stop_loss", 0))
+        tgt    = float(row.get("target", 0))
+        rps    = entry - sl
+        shares = int(final_risk_aud / rps) if rps > 0 else 0
+        log.info(
+            "  #%-2s  %-6s  entry=%.3f  stop=%.3f  target=%.3f  "
+            "risk=$%.0f  shares≈%d  mult=%.2f",
+            rank,
+            ticker.replace(".AX", ""),
+            entry, sl, tgt,
+            final_risk_aud, shares, risk_multiplier,
+        )
+
+    blocked_count = summary["signals_in"] - len(signals_out)
+    if blocked_count > 0:
+        log.info(
+            "  … %d signal(s) dropped (only %d slot(s) available)",
+            blocked_count, slots_available,
+        )
+
+    # ── 8. Write output ───────────────────────────────────────────────────────
+    _write_final(signals_out, dry_run)
+
+    log.info("=" * 60)
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="ASX Swing Engine — portfolio risk gate")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Print decisions without writing signals_final.csv")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = _parse_args()
+    summary = run_risk_engine(dry_run=args.dry_run)
+    print()
+    import pprint
+    pprint.pprint(summary)
