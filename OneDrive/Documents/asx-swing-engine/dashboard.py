@@ -228,24 +228,28 @@ st.markdown("---")
 # Regime status bar
 # ---------------------------------------------------------------------------
 _REGIME_COLOURS = {
-    "BULL":     "#26a69a",
-    "CHOPPY":   "#f5a623",
+    "BULL":      "#26a69a",
+    "WEAK_BULL": "#9ccc65",
+    "CHOPPY":    "#f5a623",
     "BEAR":     "#ef5350",
     "HIGH_VOL": "#9c27b0",
 }
 _REGIME_BG = {
-    "BULL":     "#0d2b1e",
-    "CHOPPY":   "#2b1e0d",
-    "BEAR":     "#2b0d0d",
-    "HIGH_VOL": "#1e0d2b",
+    "BULL":      "#0d2b1e",
+    "WEAK_BULL": "#1a2b0d",
+    "CHOPPY":    "#2b1e0d",
+    "BEAR":      "#2b0d0d",
+    "HIGH_VOL":  "#1e0d2b",
 }
 
-_rd = _load_regime()
-_regime_name = _rd.get("regime", "UNKNOWN")
-_psm         = _rd.get("position_size_multiplier", 1.0)
-_confidence  = _rd.get("confidence", None)
-_ts          = _rd.get("timestamp", None)
-_ind         = _rd.get("indicators", {})
+_rd                   = _load_regime()
+_regime_name          = _rd.get("regime", "UNKNOWN")
+_psm                  = _rd.get("position_size_multiplier", 1.0)
+_confidence           = _rd.get("confidence", None)
+_ts                   = _rd.get("timestamp", None)
+_ind                  = _rd.get("indicators", {})
+_dual_momentum        = _rd.get("dual_momentum_penalty", False)
+_require_all_triggers = _rd.get("require_all_triggers", False)
 
 if _regime_name in _REGIME_COLOURS:
     _badge_colour = _REGIME_COLOURS[_regime_name]
@@ -261,6 +265,7 @@ if _regime_name in _REGIME_COLOURS:
     # Key indicator snippets
     _xjo   = _ind.get("xjo_close")
     _e200  = _ind.get("ema_200")
+    _roc   = _ind.get("roc_20")
     _slope = _ind.get("ema_50_slope")
     _brd   = _ind.get("market_breadth")
     _atr_p = _ind.get("atr_pct")
@@ -273,10 +278,15 @@ if _regime_name in _REGIME_COLOURS:
             f"XJO <strong>{_xjo:,.0f}</strong> "
             f"<span style='color:{_vs200_c}'>{_vs200:+.1f}% vs 200 EMA</span>"
         )
+    if _roc is not None:
+        _roc_c = "#26a69a" if _roc >= 0 else "#ef5350"
+        _ind_parts.append(
+            f"ROC-20 <span style='color:{_roc_c}'>{_roc:+.1f}%</span>"
+        )
     if _slope is not None:
         _slope_c = "#26a69a" if _slope >= 0 else "#ef5350"
         _ind_parts.append(
-            f"50 EMA slope <span style='color:{_slope_c}'>{_slope:+.2f}</span>"
+            f"50 EMA slope <span style='color:{_slope_c}'>{_slope:+.2f}%</span>"
         )
     if _brd is not None:
         _ind_parts.append(f"Breadth <strong>{_brd:.0f}%</strong>")
@@ -290,6 +300,16 @@ if _regime_name in _REGIME_COLOURS:
         if _ind_parts else ""
     )
 
+    # Dual momentum penalty warning pill
+    _penalty_html = ""
+    if _dual_momentum:
+        _penalty_html = (
+            "<span style='background:#2b1a00;color:#ff9800;border:1px solid #ff980044;"
+            "border-radius:6px;padding:2px 10px;font-size:11px;font-weight:700;"
+            "letter-spacing:0.05em' title='Both ROC-20 and EMA-50 slope are negative'>"
+            "&#9888; DUAL MOMENTUM  &nbsp;·&nbsp; 3 TRIGGERS REQUIRED</span>"
+        )
+
     st.markdown(f"""
     <div style="background:#111111;border:1px solid #2a2a2a;border-radius:8px;
                 padding:12px 18px;display:flex;align-items:center;
@@ -301,6 +321,7 @@ if _regime_name in _REGIME_COLOURS:
                      letter-spacing:0.08em">{_regime_name}</span>
         <span style="color:#e0e0e0;font-size:13px">{_conf_str}</span>
         <span style="color:#888;font-size:13px">{_psm_str}</span>
+        {_penalty_html}
         {_ind_html}
       </div>
       <div style="text-align:right">{_ts_str}</div>

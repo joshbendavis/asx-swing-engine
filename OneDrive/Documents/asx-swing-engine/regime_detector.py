@@ -232,18 +232,25 @@ def _calc_market_breadth() -> float:
 
 
 def _classify_regime(
-    above_200:    bool,
-    atr_pct:      float,
-    ema_50_slope: float,
+    above_200:      bool,
+    atr_pct:        float,
+    ema_50_slope:   float,
+    roc_20:         float,
     market_breadth: float,
 ) -> str:
-    """Return regime string in priority order."""
+    """
+    Return regime string in priority order:
+      HIGH_VOL → BEAR → CHOPPY → WEAK_BULL → BULL
+    """
     if atr_pct > 2.5:
         return "HIGH_VOL"
     if not above_200:
         return "BEAR"
     if abs(ema_50_slope) < 0.1 and market_breadth < 50:
         return "CHOPPY"
+    # WEAK_BULL: above 200 EMA but momentum is deteriorating
+    if roc_20 < 0 or ema_50_slope < 0:
+        return "WEAK_BULL"
     return "BULL"
 
 
@@ -266,6 +273,18 @@ def _calc_confidence(
             score -= 15
         if ema_50_slope < 0.1:
             score -= 10
+
+    elif regime == "WEAK_BULL":
+        score = 65
+        # dual momentum penalty — both indicators negative
+        if roc_20 < 0 and ema_50_slope < 0:
+            score -= 15
+        elif roc_20 < 0 or ema_50_slope < 0:
+            score -= 5
+        if market_breadth > 60:
+            score += 10
+        if abs(ema_50_slope) < 0.05:
+            score -= 10   # nearly flat is worse than gently negative
 
     elif regime == "BEAR":
         score = 100
@@ -293,12 +312,29 @@ def _calc_confidence(
     return int(max(0, min(100, score)))
 
 
-_POSITION_SIZE_MAP = {
-    "BULL":     1.0,
-    "CHOPPY":   0.5,
-    "BEAR":     0.0,
-    "HIGH_VOL": 0.25,
-}
+def _confidence_to_psm(regime: str, confidence: int) -> float:
+    """
+    Derive position size multiplier from confidence score.
+    Hard overrides: BEAR is always 0.0, HIGH_VOL is capped at 0.25.
+
+      90-100  →  1.0×
+      70-89   →  0.75×
+      50-69   →  0.5×
+      < 50    →  0.0  (no trade)
+    """
+    if regime == "BEAR":
+        return 0.0
+    if confidence >= 90:
+        raw = 1.0
+    elif confidence >= 70:
+        raw = 0.75
+    elif confidence >= 50:
+        raw = 0.5
+    else:
+        raw = 0.0
+    if regime == "HIGH_VOL":
+        return min(0.25, raw)
+    return raw
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
@@ -349,10 +385,21 @@ def run_regime_detector() -> dict:
     market_breadth = _calc_market_breadth()
 
     # 4. Classify regime
-    regime = _classify_regime(above_200, atr_pct, ema_50_slope, market_breadth)
+    regime = _classify_regime(above_200, atr_pct, ema_50_slope, roc_20, market_breadth)
     log.info("Regime classified: %s", regime)
 
-    # 5. Confidence score
+    # 5. Dual momentum penalty — both ROC and slope negative
+    dual_momentum_penalty = bool(roc_20 < 0 and ema_50_slope < 0)
+    # Require all 3 triggers if dual penalty is active (overrides per-regime rules)
+    require_all_triggers  = dual_momentum_penalty
+    if dual_momentum_penalty:
+        log.warning(
+            "Dual momentum penalty: ROC-20=%.2f%% AND EMA-50 slope=%.4f%% both negative "
+            "— signals will require all 3 triggers.",
+            roc_20, ema_50_slope,
+        )
+
+    # 6. Confidence score
     confidence = _calc_confidence(
         regime         = regime,
         above_200      = above_200,
@@ -365,15 +412,17 @@ def run_regime_detector() -> dict:
     )
     log.info("Confidence: %d/100", confidence)
 
-    # 6. Position size multiplier
-    psm = _POSITION_SIZE_MAP.get(regime, 0.0)
-    log.info("Position size multiplier: %.2f", psm)
+    # 7. Position size multiplier — derived from confidence, not fixed by regime
+    psm = _confidence_to_psm(regime, confidence)
+    log.info("Position size multiplier: %.2f  (confidence-based)", psm)
 
-    # 7. Build result dict
+    # 8. Build result dict
     result = {
         "regime":                   regime,
         "confidence":               confidence,
         "position_size_multiplier": float(psm),
+        "dual_momentum_penalty":    dual_momentum_penalty,
+        "require_all_triggers":     require_all_triggers,
         "timestamp":                datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "indicators": {
             "xjo_close":      float(xjo_ind["xjo_close"]),

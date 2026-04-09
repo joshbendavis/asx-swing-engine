@@ -285,10 +285,12 @@ def run_signals() -> pd.DataFrame:
     screener_map = screener.set_index("ticker")
 
     # 1b — Load market regime
-    regime_data = _load_regime()
-    regime      = regime_data.get("regime", "BULL")
-    psm         = regime_data.get("position_size_multiplier", 1.0)
-    confidence  = regime_data.get("confidence", None)
+    regime_data          = _load_regime()
+    regime               = regime_data.get("regime", "BULL")
+    psm                  = regime_data.get("position_size_multiplier", 1.0)
+    confidence           = regime_data.get("confidence", None)
+    dual_momentum        = regime_data.get("dual_momentum_penalty", False)
+    require_all_triggers = regime_data.get("require_all_triggers", False)
 
     conf_str = f"  confidence={confidence}%" if confidence is not None else ""
     print(f"Market regime: {regime}{conf_str}  |  position_size_multiplier={psm}")
@@ -297,7 +299,14 @@ def run_signals() -> pd.DataFrame:
         print("WARNING: BEAR regime detected — skipping signal scan. No trades today.")
         return pd.DataFrame()
 
-    if regime == "CHOPPY":
+    # Determine min_triggers — dual momentum penalty overrides all regime rules
+    if require_all_triggers:
+        min_triggers = 3
+        reason = "dual momentum penalty (ROC-20 and EMA-50 slope both negative)"
+        if regime == "CHOPPY":
+            reason = "CHOPPY + " + reason
+        print(f"Requiring all 3 triggers: {reason}.")
+    elif regime == "CHOPPY":
         min_triggers = 3
         print("CHOPPY regime: raising min_triggers to 3 (all 3 conditions must fire).")
     else:
@@ -305,9 +314,16 @@ def run_signals() -> pd.DataFrame:
 
     if regime == "HIGH_VOL":
         print(
-            "HIGH_VOL regime: position sizes will be halved by ibkr_executor "
-            f"(position_size_multiplier={psm} is in regime.json)."
+            f"HIGH_VOL regime: position sizes capped at {psm}x "
+            "(ibkr_executor reads position_size_multiplier from regime.json)."
         )
+    if regime == "WEAK_BULL":
+        print(
+            f"WEAK_BULL regime: momentum deteriorating — "
+            f"position size={psm}x, min_triggers={min_triggers}."
+        )
+    if dual_momentum and regime not in ("BEAR", "HIGH_VOL"):
+        print("Dual momentum penalty active: ROC-20 and EMA-50 slope both negative.")
 
     # 2 — Download recent OHLCV
     print(f"Downloading {HISTORY_PERIOD} price data for {len(tickers)} tickers ...")
