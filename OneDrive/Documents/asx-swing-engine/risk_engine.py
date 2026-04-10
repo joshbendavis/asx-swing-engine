@@ -5,27 +5,29 @@ Portfolio-level risk gate that sits between signal generation and IBKR execution
 
 Reads:
     results/signals_output.csv   — raw signals from signals.py
-    results/regime.json          — position_size_multiplier + regime
+    results/regime.json          — market context (informational only, no sizing effect)
     logs/trades.csv              — open bracket orders for exposure/heat
-    results/screener_output.csv  — sector data for concentration cap
     results/sector_cache.json    — persistent sector cache (auto-populated)
 
 Writes:
-    results/signals_final.csv    — adjusted, gated signals for ibkr_executor
+    results/signals_final.csv    — gated signals for ibkr_executor
     results/sector_cache.json    — updated sector cache after any yfinance lookups
 
-Six checks applied per signal (after portfolio-level gates pass):
+PRODUCTION CONFIGURATION (validated 8-year backtest, 2017-2026):
+    Risk per trade : 1.5% of account — FLAT, no regime scaling
+    Regime         : informational only — displayed on dashboard, never adjusts sizing
 
-  1. EXPOSURE GATE      — if >= MAX_POSITIONS already open, block all new orders.
-  2. HEAT CHECK         — if open risk >= HEAT_LIMIT_PCT, scale or block new sizes.
-  3. PSM SCALING        — multiply per-trade risk by regime position_size_multiplier.
-  4. SCORE RANKING      — signals sorted by composite_score desc before slot trimming.
-  5. MIN RISK FLOOR     — skip any trade where final risk < MIN_RISK_AUD ($75).
-  6. SECTOR CAP         — skip if the same GICS sector already has >= SECTOR_CAP (2)
-                          open positions.  Unknown sectors are not capped.
+Five checks applied per signal (after portfolio-level gates pass):
+
+  1. EXPOSURE GATE  — if >= MAX_POSITIONS already open, block all new orders.
+  2. HEAT CHECK     — if open risk >= HEAT_LIMIT_PCT, scale or block new sizes.
+  3. SCORE RANKING  — signals sorted by composite_score desc before slot trimming.
+  4. MIN RISK FLOOR — skip any trade where risk < MIN_RISK_AUD ($75).
+  5. SECTOR CAP     — skip if the same GICS sector already has >= SECTOR_CAP (2)
+                      open positions.  Unknown sectors are not capped.
 
 Output columns added to signals_final.csv:
-    risk_multiplier   — float; ibkr_executor multiplies base risk by this.
+    risk_multiplier   — always 1.0 (flat sizing); kept for ibkr_executor compatibility.
     adjusted_risk_aud — pre-computed dollar risk for the position.
     sector            — GICS sector string used for concentration check.
 
@@ -237,25 +239,11 @@ def run_risk_engine(dry_run: bool = False) -> dict:
     # ── 2. Load regime ────────────────────────────────────────────────────────
     regime_data = _load_regime()
     regime      = regime_data.get("regime", "BULL")
-    psm         = float(regime_data.get("position_size_multiplier", 1.0))
     confidence  = regime_data.get("confidence", 100)
     summary["regime"] = regime
-    summary["psm"]    = psm
-    log.info("Regime: %s  |  confidence=%s  |  PSM=%.2f", regime, confidence, psm)
-
-    # BEAR regime — no orders regardless
-    if regime == "BEAR":
-        _write_empty("BEAR regime", dry_run)
-        summary["blocked"] = True
-        summary["block_reason"] = "BEAR regime"
-        return summary
-
-    # PSM = 0 from confidence table — no trade
-    if psm == 0.0:
-        _write_empty(f"confidence too low ({confidence}) → PSM=0.0", dry_run)
-        summary["blocked"] = True
-        summary["block_reason"] = f"confidence {confidence} → PSM 0.0"
-        return summary
+    summary["psm"]    = 1.0   # flat sizing — regime is informational only
+    log.info("Regime: %s  |  confidence=%s  |  sizing=FLAT 1.0x (regime informational only)",
+             regime, confidence)
 
     # ── 3. Exposure gate ──────────────────────────────────────────────────────
     open_trades = _load_open_trades()
@@ -312,26 +300,18 @@ def run_risk_engine(dry_run: bool = False) -> dict:
         return summary
 
     # ── 5. Compute effective risk per trade ───────────────────────────────────
-    # Cap signals to available slots before dividing heat budget
+    # Flat 1.5% sizing — regime does NOT adjust position size.
+    # Heat cap is the only runtime constraint (prevents exceeding 9% portfolio heat).
     n_new          = min(slots_available, len(signals))
     heat_risk_cap  = heat_budget_aud / n_new       # fair share of remaining budget
-
-    # Take the tighter of base risk and heat cap
-    effective_risk = min(base_risk_aud, heat_risk_cap)
-
-    # Apply regime PSM
-    final_risk_aud = effective_risk * psm
-
-    # Express as a multiplier relative to the raw base (for ibkr_executor)
+    final_risk_aud = min(base_risk_aud, heat_risk_cap)
     risk_multiplier = round(final_risk_aud / base_risk_aud, 4) if base_risk_aud > 0 else 0.0
 
     summary["risk_multiplier"] = risk_multiplier
 
     log.info(
-        "Sizing: base=$%.0f  heat_cap=$%.0f  effective=$%.0f  "
-        "× PSM(%.2f) → final=$%.0f  multiplier=%.4f",
-        base_risk_aud, heat_risk_cap, effective_risk, psm,
-        final_risk_aud, risk_multiplier,
+        "Sizing: base=$%.0f  heat_cap=$%.0f  final=$%.0f  multiplier=%.4f",
+        base_risk_aud, heat_risk_cap, final_risk_aud, risk_multiplier,
     )
 
     if final_risk_aud < 1.0:
@@ -339,7 +319,7 @@ def run_risk_engine(dry_run: bool = False) -> dict:
             f"final risk ${final_risk_aud:.2f} too small to place any trade", dry_run
         )
         summary["blocked"]      = True
-        summary["block_reason"] = "final risk < $1 after adjustments"
+        summary["block_reason"] = "final risk < $1 after heat adjustment"
         return summary
 
     # ── 6. Sort by composite_score desc (best signals first) ─────────────────
@@ -399,10 +379,9 @@ def run_risk_engine(dry_run: bool = False) -> dict:
 
         # Passed — approve
         row = row.copy()
-        row["risk_multiplier"]   = risk_multiplier
+        row["risk_multiplier"]   = risk_multiplier   # always 1.0 or heat-capped
         row["adjusted_risk_aud"] = round(final_risk_aud, 2)
-        row["regime"]            = regime
-        row["psm"]               = psm
+        row["regime"]            = regime            # informational only
         row["sector"]            = sector
         approved.append(row)
 
@@ -424,11 +403,11 @@ def run_risk_engine(dry_run: bool = False) -> dict:
         rps    = entry - sl
         shares = int(final_risk_aud / rps) if rps > 0 else 0
         log.info(
-            "  ✓  %-6s  entry=%.3f  stop=%.3f  target=%.3f  "
-            "risk=$%.0f  shares≈%d  mult=%.2f  sector=%s",
+            "  OK  %-6s  entry=%.3f  stop=%.3f  target=%.3f  "
+            "risk=$%.0f  shares~%d  sector=%s",
             ticker.replace(".AX", ""),
             entry, sl, tgt,
-            final_risk_aud, shares, risk_multiplier, sector,
+            final_risk_aud, shares, sector,
         )
 
     if skipped_floor:

@@ -312,29 +312,24 @@ def _calc_confidence(
     return int(max(0, min(100, score)))
 
 
-def _confidence_to_psm(regime: str, confidence: int) -> float:
+def _regime_to_psm(regime: str) -> float:
     """
-    Derive position size multiplier from confidence score.
-    Hard overrides: BEAR is always 0.0, HIGH_VOL is capped at 0.25.
+    Flat position-size multiplier per regime.
+    No hard blocking — every regime allows trading at reduced size.
 
-      90-100  →  1.0×
-      70-89   →  0.75×
-      50-69   →  0.5×
-      < 50    →  0.0  (no trade)
+      BULL      → 1.00×  (full risk)
+      WEAK_BULL → 0.75×
+      CHOPPY    → 0.60×
+      BEAR      → 0.50×  (half size, never zero)
+      HIGH_VOL  → 0.25×
     """
-    if regime == "BEAR":
-        return 0.0
-    if confidence >= 90:
-        raw = 1.0
-    elif confidence >= 70:
-        raw = 0.75
-    elif confidence >= 50:
-        raw = 0.5
-    else:
-        raw = 0.0
-    if regime == "HIGH_VOL":
-        return min(0.25, raw)
-    return raw
+    return {
+        "BULL":      1.00,
+        "WEAK_BULL": 0.75,
+        "CHOPPY":    0.60,
+        "BEAR":      0.50,
+        "HIGH_VOL":  0.25,
+    }.get(regime, 1.0)
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
@@ -412,9 +407,9 @@ def run_regime_detector() -> dict:
     )
     log.info("Confidence: %d/100", confidence)
 
-    # 7. Position size multiplier — derived from confidence, not fixed by regime
-    psm = _confidence_to_psm(regime, confidence)
-    log.info("Position size multiplier: %.2f  (confidence-based)", psm)
+    # 7. Position size multiplier — flat per regime, no hard blocking
+    psm = _regime_to_psm(regime)
+    log.info("Position size multiplier: %.2f  (regime=%s, never zero)", psm, regime)
 
     # 8. Build result dict
     result = {

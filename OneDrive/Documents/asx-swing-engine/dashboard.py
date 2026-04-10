@@ -242,23 +242,19 @@ _REGIME_BG = {
     "HIGH_VOL":  "#1e0d2b",
 }
 
-_rd                   = _load_regime()
-_regime_name          = _rd.get("regime", "UNKNOWN")
-_psm                  = _rd.get("position_size_multiplier", 1.0)
-_confidence           = _rd.get("confidence", None)
-_ts                   = _rd.get("timestamp", None)
-_ind                  = _rd.get("indicators", {})
-_dual_momentum        = _rd.get("dual_momentum_penalty", False)
-_require_all_triggers = _rd.get("require_all_triggers", False)
+_rd            = _load_regime()
+_regime_name   = _rd.get("regime", "UNKNOWN")
+_confidence    = _rd.get("confidence", None)
+_ts            = _rd.get("timestamp", None)
+_ind           = _rd.get("indicators", {})
+_dual_momentum = _rd.get("dual_momentum_penalty", False)
 
 if _regime_name in _REGIME_COLOURS:
     _badge_colour = _REGIME_COLOURS[_regime_name]
     _badge_bg     = _REGIME_BG[_regime_name]
     _conf_str     = f"Confidence: {_confidence}%" if _confidence is not None else ""
-    _psm_str      = f"Position size: {_psm}&times;"
     _ts_str       = (
-        f"<span style='color:#444;font-size:11px'>"
-        f"Classified: {_ts}</span>"
+        f"<span style='color:#444;font-size:11px'>Classified: {_ts}</span>"
         if _ts else ""
     )
 
@@ -272,7 +268,7 @@ if _regime_name in _REGIME_COLOURS:
 
     _ind_parts = []
     if _xjo is not None and _e200 is not None and _e200 != 0:
-        _vs200 = (_xjo - _e200) / _e200 * 100
+        _vs200   = (_xjo - _e200) / _e200 * 100
         _vs200_c = "#26a69a" if _vs200 >= 0 else "#ef5350"
         _ind_parts.append(
             f"XJO <strong>{_xjo:,.0f}</strong> "
@@ -280,9 +276,7 @@ if _regime_name in _REGIME_COLOURS:
         )
     if _roc is not None:
         _roc_c = "#26a69a" if _roc >= 0 else "#ef5350"
-        _ind_parts.append(
-            f"ROC-20 <span style='color:{_roc_c}'>{_roc:+.1f}%</span>"
-        )
+        _ind_parts.append(f"ROC-20 <span style='color:{_roc_c}'>{_roc:+.1f}%</span>")
     if _slope is not None:
         _slope_c = "#26a69a" if _slope >= 0 else "#ef5350"
         _ind_parts.append(
@@ -295,33 +289,41 @@ if _regime_name in _REGIME_COLOURS:
 
     _ind_html = (
         "<span style='color:#666;font-size:11px'>"
-        + " &nbsp;·&nbsp; ".join(_ind_parts)
+        + " &nbsp;&middot;&nbsp; ".join(_ind_parts)
         + "</span>"
         if _ind_parts else ""
     )
 
-    # Dual momentum penalty warning pill
-    _penalty_html = ""
+    # Dual momentum note (informational only — no sizing effect)
+    _dual_html = ""
     if _dual_momentum:
-        _penalty_html = (
-            "<span style='background:#2b1a00;color:#ff9800;border:1px solid #ff980044;"
-            "border-radius:6px;padding:2px 10px;font-size:11px;font-weight:700;"
-            "letter-spacing:0.05em' title='Both ROC-20 and EMA-50 slope are negative'>"
-            "&#9888; DUAL MOMENTUM  &nbsp;·&nbsp; 3 TRIGGERS REQUIRED</span>"
+        _dual_html = (
+            "<span style='background:#1a1a1a;color:#888;border:1px solid #33333366;"
+            "border-radius:6px;padding:2px 10px;font-size:11px;"
+            "letter-spacing:0.04em' "
+            "title='Both ROC-20 and EMA-50 slope negative — market context only'>"
+            "DUAL MOMENTUM</span>"
         )
+
+    # Informational-only label
+    _info_label = (
+        "<span style='background:#1a1a2a;color:#5577aa;border:1px solid #33448866;"
+        "border-radius:6px;padding:2px 10px;font-size:10px;font-weight:600;"
+        "letter-spacing:0.06em'>MARKET CONTEXT</span>"
+    )
 
     st.markdown(f"""
     <div style="background:#111111;border:1px solid #2a2a2a;border-radius:8px;
                 padding:12px 18px;display:flex;align-items:center;
                 justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:8px">
-      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        {_info_label}
         <span style="background:{_badge_bg};color:{_badge_colour};
                      border:1px solid {_badge_colour}66;border-radius:6px;
                      padding:4px 14px;font-size:15px;font-weight:800;
                      letter-spacing:0.08em">{_regime_name}</span>
-        <span style="color:#e0e0e0;font-size:13px">{_conf_str}</span>
-        <span style="color:#888;font-size:13px">{_psm_str}</span>
-        {_penalty_html}
+        <span style="color:#777;font-size:13px">{_conf_str}</span>
+        {_dual_html}
         {_ind_html}
       </div>
       <div style="text-align:right">{_ts_str}</div>
@@ -332,10 +334,13 @@ else:
     st.markdown("""
     <div style="background:#111111;border:1px solid #2a2a2a;border-radius:8px;
                 padding:12px 18px;display:flex;align-items:center;gap:16px;margin-bottom:8px">
+      <span style="background:#1a1a2a;color:#5577aa;border:1px solid #33448866;
+                   border-radius:6px;padding:2px 10px;font-size:10px;
+                   font-weight:600;letter-spacing:0.06em">MARKET CONTEXT</span>
       <span style="background:#1e1e1e;color:#666;border:1px solid #33333366;
                    border-radius:6px;padding:4px 14px;font-size:15px;
                    font-weight:800;letter-spacing:0.08em">UNKNOWN</span>
-      <span style="color:#555;font-size:13px">Run pipeline to classify regime</span>
+      <span style="color:#555;font-size:13px">Run pipeline to classify</span>
     </div>
     """, unsafe_allow_html=True)
 
