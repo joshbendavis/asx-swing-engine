@@ -15,6 +15,7 @@ Auto-refreshes every 5 minutes.
 
 import json
 import math
+import re
 from datetime import datetime, date
 from pathlib import Path
 
@@ -203,6 +204,332 @@ def _load_screener() -> pd.DataFrame:
     if not SCREENER_CSV.exists():
         return pd.DataFrame()
     return pd.read_csv(SCREENER_CSV)
+
+
+@st.cache_data(ttl=REFRESH_SECS)
+def _parse_last_run() -> dict:
+    """Parse the most recent run_*.log file and extract pipeline status.
+
+    Returns a dict with keys:
+        run_date        date | None
+        run_time        str "HH:MM" | None
+        steps           dict  step_name -> "ok"|"warn"|"error"|"skip"|None
+        screener_count  int | None
+        signals_count   int | None
+        orders_placed   int | None
+        orders_blocked  bool
+        complete        bool
+        log_file        str | None
+    """
+    log_dir = Path("logs")
+    if not log_dir.exists():
+        return {}
+    run_logs = sorted(log_dir.glob("run_*.log"), reverse=True)
+    if not run_logs:
+        return {}
+
+    log_path = run_logs[0]
+
+    # Extract date/time from filename: run_YYYYMMDD_HHMMSS.log
+    fname_m = re.match(r"run_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})\d{2}\.log",
+                       log_path.name)
+    if not fname_m:
+        return {}
+    y, mo, d, h, mi = fname_m.groups()
+    run_date = date(int(y), int(mo), int(d))
+    run_time = f"{h}:{mi}"
+
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    steps = {k: None for k in
+             ["regime", "screener", "signals", "risk", "charts", "email", "ibkr", "exit_logger"]}
+    screener_count: int | None = None
+    signals_count:  int | None = None
+    orders_placed:  int | None = None
+    orders_blocked: bool = False
+    complete:       bool = False
+
+    for line in content.splitlines():
+
+        # ── Run start time (from log body — more precise than filename) ───────
+        if "ASX SWING ENGINE - daily run" in line:
+            ts = line.split("|")[0].strip()
+            if re.match(r"\d{2}:\d{2}:\d{2}", ts):
+                run_time = ts[:5]
+
+        # ── Step 0: Regime ────────────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - Detecting market regime", line):
+            steps["regime"] = "ok"
+        if "Regime written" in line:
+            steps["regime"] = "ok"
+
+        # ── Step 1: Screener ──────────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - Running screener", line):
+            steps["screener"] = "ok"
+        if re.search(r"Step \d+/\d+.*(Screener skipped|--no-screener)", line):
+            steps["screener"] = "skip"
+        m2 = re.search(r"Screener complete: (\d+) stocks passed", line)
+        if m2:
+            screener_count = int(m2.group(1))
+
+        # ── Step 2: Signals ───────────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - Running signal scanner", line):
+            steps["signals"] = "ok"
+        if re.search(r"Step \d+/\d+ - Signals skipped", line):
+            steps["signals"] = "skip"
+        if "Signal scanner failed" in line:
+            steps["signals"] = "error"
+        m2 = re.search(r"(\d+) signal\(s\) found", line)
+        if m2:
+            signals_count = int(m2.group(1))
+        if "No entry signals today" in line and signals_count is None:
+            signals_count = 0
+
+        # ── Step 3: Risk engine ───────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - Running risk engine", line):
+            steps["risk"] = "ok"
+        if re.search(r"Step \d+/\d+ - Risk engine skipped", line):
+            steps["risk"] = "skip"
+        if "Risk engine failed" in line:
+            steps["risk"] = "error"
+        if "Risk engine BLOCKED all orders" in line:
+            steps["risk"] = "warn"
+            orders_blocked = True
+        m2 = re.search(r"Risk engine approved: (\d+)/\d+ signal", line)
+        if m2:
+            orders_placed = int(m2.group(1))
+
+        # ── Step 4: Charts ────────────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - Generating charts", line):
+            steps["charts"] = "ok"
+        if re.search(r"Step \d+/\d+ - Charts skipped", line):
+            steps["charts"] = "skip"
+        if "Chart generation failed" in line:
+            steps["charts"] = "error"
+
+        # ── Step 5: Email ─────────────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - Sending email", line):
+            steps["email"] = "ok"
+        if re.search(r"Step \d+/\d+ - Email skipped", line):
+            steps["email"] = "skip"
+        if "EMAIL_FROM or EMAIL_PASSWORD not set" in line:
+            steps["email"] = "skip"   # not configured — expected, not an error
+        if "Email sent successfully" in line:
+            steps["email"] = "ok"
+        if "Email failed" in line:
+            steps["email"] = "error"
+
+        # ── Step 6: IBKR ──────────────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - IBKR order submission", line):
+            steps["ibkr"] = "ok"
+        if re.search(r"Step \d+/\d+ - IBKR skipped", line):
+            steps["ibkr"] = "skip"
+        if re.search(r"Step \d+/\d+ - no signals file found, skipping IBKR", line):
+            steps["ibkr"] = "skip"
+        m2 = re.search(r"IBKR: (\d+) bracket order\(s\) submitted", line)
+        if m2:
+            orders_placed = int(m2.group(1))
+            steps["ibkr"] = "ok"
+        if "IBKR executor failed" in line:
+            # "No columns to parse from file" = signals_final.csv empty (portfolio full / no trades)
+            # That's expected behaviour — show as warning, not hard error
+            if "No columns to parse" in line:
+                steps["ibkr"] = "warn"
+            else:
+                steps["ibkr"] = "error"   # real connection / API failure
+
+        # ── Step 7: Exit logger ───────────────────────────────────────────────
+        if re.search(r"Step \d+/\d+ - Starting exit logger", line):
+            steps["exit_logger"] = "ok"
+        if "Exit logger already running" in line:
+            steps["exit_logger"] = "ok"
+        if re.search(r"Step \d+/\d+ - Exit logger skipped", line):
+            steps["exit_logger"] = "skip"
+
+        # ── Completion marker ─────────────────────────────────────────────────
+        if "Daily run complete" in line:
+            complete = True
+
+    return {
+        "run_date":       run_date,
+        "run_time":       run_time,
+        "steps":          steps,
+        "screener_count": screener_count,
+        "signals_count":  signals_count,
+        "orders_placed":  orders_placed,
+        "orders_blocked": orders_blocked,
+        "complete":       complete,
+        "log_file":       log_path.name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Last Run status bar  (very first content block)
+# ---------------------------------------------------------------------------
+_STEP_LABELS = {
+    "regime":       "Regime",
+    "screener":     "Screener",
+    "signals":      "Signals",
+    "risk":         "Risk",
+    "charts":       "Charts",
+    "email":        "Email",
+    "ibkr":         "IBKR",
+    "exit_logger":  "Exit Logger",
+}
+_STEP_STYLE = {
+    # status  -> (bg,      text,    border)
+    "ok":    ("#0d2b1e", "#26a69a", "#26a69a55"),
+    "warn":  ("#2b1e0d", "#f5a623", "#f5a62355"),
+    "error": ("#2b0d0d", "#ef5350", "#ef535055"),
+    "skip":  ("#1a1a1a", "#555555", "#33333355"),
+    None:    ("#1a1a1a", "#444444", "#33333333"),
+}
+_STATUS_ICON = {"ok": "✓", "warn": "!", "error": "✗", "skip": "—", None: "·"}
+
+
+def _step_pill(name: str, status, detail: str = "") -> str:
+    bg, fg, border = _STEP_STYLE.get(status, _STEP_STYLE[None])
+    icon  = _STATUS_ICON.get(status, "·")
+    label = _STEP_LABELS.get(name, name)
+    body  = f"{icon} {label}"
+    if detail:
+        body += f" <span style='opacity:0.7;font-weight:400'>{detail}</span>"
+    return (
+        f"<span style='background:{bg};color:{fg};border:1px solid {border};"
+        f"border-radius:5px;padding:2px 9px;font-size:11px;font-weight:600;"
+        f"white-space:nowrap'>{body}</span>"
+    )
+
+
+_lr = _parse_last_run()
+
+if _lr:
+    _today       = date.today()
+    _ran_today   = (_lr.get("run_date") == _today)
+    _complete    = _lr.get("complete", False)
+    _run_dt      = _lr.get("run_date")
+    _run_tm      = _lr.get("run_time", "")
+    _steps       = _lr.get("steps", {})
+    _sc          = _lr.get("screener_count")
+    _sig         = _lr.get("signals_count")
+    _ord         = _lr.get("orders_placed")
+    _blocked     = _lr.get("orders_blocked", False)
+    _log_name    = _lr.get("log_file", "")
+
+    # ── "Ran today" / "Not run today" badge ───────────────────────────────
+    if _ran_today:
+        _run_badge = (
+            "<span style='background:#0d2b1e;color:#26a69a;"
+            "border:1px solid #26a69a55;border-radius:5px;"
+            "padding:3px 10px;font-size:11px;font-weight:700;"
+            "letter-spacing:0.04em'>RAN TODAY</span>"
+        )
+    else:
+        _run_badge = (
+            "<span style='background:#2b0d0d;color:#ef5350;"
+            "border:1px solid #ef535055;border-radius:5px;"
+            "padding:3px 10px;font-size:11px;font-weight:700;"
+            "letter-spacing:0.04em'>NOT RUN TODAY</span>"
+        )
+
+    # ── Datetime string ────────────────────────────────────────────────────
+    if _run_dt:
+        _dt_str = (
+            f"<span style='color:#666;font-size:12px'>"
+            f"Last run: {_run_dt.strftime('%a %d %b %Y')} &nbsp;·&nbsp; {_run_tm}"
+            f"</span>"
+        )
+    else:
+        _dt_str = ""
+
+    # ── Completion badge ───────────────────────────────────────────────────
+    if _complete:
+        _comp_badge = (
+            "<span style='color:#444;font-size:11px;margin-left:6px'>COMPLETE</span>"
+        )
+    else:
+        _comp_badge = (
+            "<span style='color:#5a3a0d;font-size:11px;margin-left:6px'>INCOMPLETE</span>"
+        )
+
+    # ── Per-step pills ─────────────────────────────────────────────────────
+    _pills_html = ""
+    for _skey in ["regime", "screener", "signals", "risk", "charts", "email", "ibkr", "exit_logger"]:
+        _sval = _steps.get(_skey)
+        _detail = ""
+        if _skey == "screener" and _sc is not None:
+            _detail = f"({_sc})"
+        elif _skey == "signals" and _sig is not None:
+            _detail = f"({_sig})"
+        elif _skey == "risk" and _blocked:
+            _detail = "(blocked)"
+        elif _skey == "risk" and _ord is not None and not _blocked:
+            _detail = f"({_ord} approved)"
+        elif _skey == "ibkr" and _sval == "ok" and _ord is not None:
+            _detail = f"({_ord} orders)"
+        elif _skey == "ibkr" and _sval == "warn":
+            _detail = "(no orders)"
+        _pills_html += _step_pill(_skey, _sval, _detail) + "&nbsp;"
+
+    # ── Summary counts row ─────────────────────────────────────────────────
+    _summary_parts = []
+    if _sc is not None:
+        _summary_parts.append(
+            f"<span style='color:#888;font-size:11px'>"
+            f"<strong style='color:#aaa'>{_sc}</strong> screened</span>"
+        )
+    if _sig is not None:
+        _sig_c = "#26a69a" if _sig > 0 else "#666"
+        _summary_parts.append(
+            f"<span style='color:#888;font-size:11px'>"
+            f"<strong style='color:{_sig_c}'>{_sig}</strong> signal{'s' if _sig != 1 else ''}</span>"
+        )
+    if _ord is not None:
+        _ord_c = "#26a69a" if _ord > 0 else "#666"
+        _summary_parts.append(
+            f"<span style='color:#888;font-size:11px'>"
+            f"<strong style='color:{_ord_c}'>{_ord}</strong> order{'s' if _ord != 1 else ''} placed</span>"
+        )
+    elif _blocked:
+        _summary_parts.append(
+            "<span style='color:#888;font-size:11px'>"
+            "<strong style='color:#f5a623'>0</strong> orders &mdash; portfolio full</span>"
+        )
+    _summary_html = (
+        " &nbsp;&middot;&nbsp; ".join(_summary_parts) if _summary_parts else ""
+    )
+
+    st.markdown(f"""
+    <div style="background:#0f0f0f;border:1px solid #222;border-radius:8px;
+                padding:10px 16px;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
+        {_run_badge}
+        {_dt_str}
+        {_comp_badge}
+        {"&nbsp;&nbsp;" + _summary_html if _summary_html else ""}
+        <span style="color:#333;font-size:10px;margin-left:auto">{_log_name}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
+        {_pills_html}
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+else:
+    st.markdown("""
+    <div style="background:#0f0f0f;border:1px solid #222;border-radius:8px;
+                padding:10px 16px;margin-bottom:10px">
+      <span style="background:#2b0d0d;color:#ef5350;border:1px solid #ef535055;
+                   border-radius:5px;padding:3px 10px;font-size:11px;font-weight:700;
+                   letter-spacing:0.04em">NOT RUN TODAY</span>
+      <span style="color:#555;font-size:12px;margin-left:12px">
+        No log files found in logs/ — run <code>python run_daily.py</code> to start.
+      </span>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
