@@ -4,25 +4,32 @@ backtest_full.py - ASX Swing Engine | Definitive 8-Year Validation Backtest
 ============================================================================
 Compares two scenarios side by side over 2017-2026:
 
-  A. RS top 20%  (previous best baseline — RS filter only, no regime)
-  B. Full system (every live production filter active):
-       • RS top 20% cross-sectional filter
-       • Per-bar regime classification (BULL/WEAK_BULL/CHOPPY/HIGH_VOL/BEAR)
-       • Confidence-based position sizing (PSM table from confidence score)
-       • Dual-momentum penalty → require all 3 entry triggers
-       • Sector concentration cap (max 2 open positions per GICS sector)
-       • Minimum risk floor ($75 per trade after PSM applied)
-       • Fixed 2:1 R:R target
+  A. Idealized   — $10 round-trip commission, 0% slippage, no gap risk
+                   (previous benchmark — theoretical upper bound)
+  B. Realistic   — IBKR $6/leg ($12 round-trip), 0.2% slippage on every fill,
+                   gap risk (if open gaps below stop, exit at open)
+
+Both scenarios use identical signal pool:
+  • RS top 20% cross-sectional filter (63-day excess return vs XJO)
+  • ≥2 entry triggers (RSI bounce / MACD cross / volume breakout ≥1.5×)
+  • Flat 1.5% risk per trade (PSM = 1.0 always — regime informational only)
+  • Entry filled at NEXT DAY OPEN (not signal-day close)
 
 Portfolio rules (match live engine exactly):
   Starting capital : $20,000 AUD
-  Risk per trade   : 1.5% of current account balance × PSM
+  Risk per trade   : 1.5% of current account balance
   Max concurrent   : 6 open positions
   Stop             : entry − 2 × ATR(14)   [signal-bar ATR]
   Target           : entry + 2 × initial_risk  (2:1 R:R)
   Breakeven        : stop → entry once close ≥ entry + 1R
   Time stop        : 20 bars
-  Commission       : $10 round-trip
+
+Realistic fill model:
+  Entry   : open_next_day × 1.002  (+0.2% slippage, buy at market)
+  Exit    : fill × 0.998           (−0.2% slippage, sell at market/stop)
+  Target  : target_price × 0.998  (limit order, fill near target)
+  Gap     : if open ≤ stop → exit at open × 0.998  (gap through stop)
+  Broker  : $6 deducted at entry + $6 at exit (IBKR ASX minimum)
 
 Usage:
   python backtest_full.py               # 2017-2026 (default period 9y)
@@ -63,7 +70,10 @@ ATR_STOP_MULT     = 2.0
 TARGET_R          = 2.0
 BREAKEVEN_R       = 1.0
 TIME_STOP_DAYS    = 20
-COMMISSION        = 10.0
+# Commission / slippage defaults — overridden per scenario in main()
+COMMISSION_ENTRY  = 6.0         # IBKR minimum per ASX order leg
+COMMISSION_EXIT   = 6.0         # IBKR minimum per ASX order leg
+SLIPPAGE_PCT      = 0.002       # 0.2% adverse slippage on all fills
 MIN_RISK_AUD      = 75.0        # mirror risk_engine.py
 SECTOR_CAP        = 2           # mirror risk_engine.py
 
@@ -504,18 +514,27 @@ def run_full_system(price_data: dict[str, pd.DataFrame],
 
 def _simulate(ind: dict[str, pd.DataFrame],
               by_entry: dict,
-              psm_series: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+              psm_series: pd.DataFrame | None = None,
+              comm_entry: float = 0.0,
+              comm_exit:  float = 10.0,
+              slippage:   float = 0.0,
+              gap_risk:   bool  = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Core simulation loop.
 
     Parameters
     ----------
-    ind        : {ticker: indicator DataFrame} from compute_indicators()
-    by_entry   : {entry_date: [candidate dicts]} pre-filtered signal pool
-    psm_series : optional DataFrame indexed by date with columns 'regime' and 'psm'.
-                 When provided, position size on each entry is scaled by the regime PSM
-                 on that day.  No blocking, no trigger re-checking — purely a size scaler.
-                 When None, all positions use full 1.0× size.
+    ind         : {ticker: indicator DataFrame} from compute_indicators()
+    by_entry    : {entry_date: [candidate dicts]} pre-filtered signal pool
+    psm_series  : optional DataFrame indexed by date with 'regime' and 'psm' columns.
+                  When None, PSM = 1.0 always (flat sizing).
+    comm_entry  : brokerage deducted at entry ($AUD).  Default 0 (idealized).
+    comm_exit   : brokerage deducted at exit ($AUD).   Default 10 (old round-trip).
+    slippage    : fractional adverse fill adjustment.  Default 0 (idealized).
+                  Entry fills at open * (1 + slippage); exits at price * (1 - slippage).
+                  For target exits, fill is at target_price * (1 - slippage).
+    gap_risk    : if True, check each bar's open against the stop before intraday checks.
+                  If open <= stop, exit at open * (1 - slippage) as 'stop_gap'.
     """
     all_dates = sorted(set().union(*[set(d.index) for d in ind.values()]))
     date_to_i = {dt: i for i, dt in enumerate(all_dates)}
@@ -536,27 +555,46 @@ def _simulate(ind: dict[str, pd.DataFrame],
             if dt not in d.index:
                 pos["bars_held"] += 1
                 continue
+
+            o = float(d["Open"].loc[dt])   # for gap-risk check
             c = float(d["Close"].loc[dt])
 
-            if not pos["be_set"] and c >= pos["be_lvl"]:
-                pos["stop"]   = pos["entry"]
-                pos["be_set"] = True
+            fill_price: float | None = None
+            exit_type:  str   | None = None
 
-            exit_type = None
-            if c <= pos["stop"]:             exit_type = "stop"
-            elif c >= pos["target"]:          exit_type = "target"
-            elif pos["bars_held"] >= TIME_STOP_DAYS: exit_type = "time"
+            # 1. Gap risk — open gaps below stop → exit at open (gapped through)
+            #    Check this BEFORE breakeven update; if it gapped, we're already out.
+            if gap_risk and o <= pos["stop"]:
+                fill_price = o * (1.0 - slippage)
+                exit_type  = "stop_gap"
+            else:
+                # Breakeven ratchet (evaluated on close)
+                if not pos["be_set"] and c >= pos["be_lvl"]:
+                    pos["stop"]   = pos["entry"]
+                    pos["be_set"] = True
+
+                # End-of-day exit triggers
+                if c <= pos["stop"]:
+                    fill_price = c * (1.0 - slippage)
+                    exit_type  = "stop"
+                elif c >= pos["target"]:
+                    # Fill at target price (limit order), not close — more realistic
+                    fill_price = pos["target"] * (1.0 - slippage)
+                    exit_type  = "target"
+                elif pos["bars_held"] >= TIME_STOP_DAYS:
+                    fill_price = c * (1.0 - slippage)
+                    exit_type  = "time"
 
             if exit_type:
-                pnl   = (c - pos["entry"]) * pos["shares"] - COMMISSION
-                pnl_r = (c - pos["entry"]) / pos["initial_risk"]
+                pnl   = (fill_price - pos["entry"]) * pos["shares"] - comm_exit
+                pnl_r = (fill_price - pos["entry"]) / pos["initial_risk"]
                 account += pnl
                 all_trades.append({
                     "ticker":        ticker,
                     "entry_date":    pos["entry_date"],
                     "exit_date":     dt,
                     "entry_price":   round(pos["entry"], 4),
-                    "exit_price":    round(c, 4),
+                    "exit_price":    round(fill_price, 4),
                     "stop":          round(pos["stop"], 4),
                     "target":        round(pos["target"], 4),
                     "initial_risk":  round(pos["initial_risk"], 4),
@@ -625,41 +663,45 @@ def _simulate(ind: dict[str, pd.DataFrame],
                 continue
 
             ep           = cand["entry_open"]
+            ep_filled    = ep * (1.0 + slippage)   # adverse slippage on buy
             atr          = cand["atr"]
-            initial_risk = atr * ATR_STOP_MULT
+            initial_risk = atr * ATR_STOP_MULT      # dollar risk/share (ATR-based)
             shares       = int(risk_aud_bar / initial_risk)
             if shares == 0:
                 continue
 
+            account -= comm_entry   # deduct $6 entry brokerage immediately
+
             open_pos[ticker] = {
                 "entry_date":   dt,
-                "entry":        ep,
+                "entry":        ep_filled,
                 "shares":       shares,
                 "initial_risk": initial_risk,
                 "risk_aud":     risk_aud_bar,
                 "psm":          psm_now,
                 "regime":       regime_now,
-                "stop":         ep - initial_risk,
-                "target":       ep + TARGET_R * initial_risk,
-                "be_lvl":       ep + BREAKEVEN_R * initial_risk,
+                "stop":         ep_filled - initial_risk,
+                "target":       ep_filled + TARGET_R * initial_risk,
+                "be_lvl":       ep_filled + BREAKEVEN_R * initial_risk,
                 "be_set":       False,
                 "bars_held":    0,
             }
 
-    # Force-close remaining at end of data
+    # Force-close remaining at end of data (apply slippage as if selling at market)
     for ticker, pos in open_pos.items():
-        d       = ind[ticker]
-        last_c  = float(d["Close"].iloc[-1])
-        last_dt = d.index[-1]
-        pnl     = (last_c - pos["entry"]) * pos["shares"] - COMMISSION
-        pnl_r   = (last_c - pos["entry"]) / pos["initial_risk"]
-        account += pnl
+        d          = ind[ticker]
+        last_c     = float(d["Close"].iloc[-1])
+        fill_last  = last_c * (1.0 - slippage)
+        last_dt    = d.index[-1]
+        pnl        = (fill_last - pos["entry"]) * pos["shares"] - comm_exit
+        pnl_r      = (fill_last - pos["entry"]) / pos["initial_risk"]
+        account   += pnl
         all_trades.append({
             "ticker":        ticker,
             "entry_date":    pos["entry_date"],
             "exit_date":     last_dt,
             "entry_price":   round(pos["entry"], 4),
-            "exit_price":    round(last_c, 4),
+            "exit_price":    round(fill_last, 4),
             "stop":          round(pos["stop"], 4),
             "target":        round(pos["target"], 4),
             "initial_risk":  round(pos["initial_risk"], 4),
@@ -702,11 +744,12 @@ def calc_metrics(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dict:
     if closed.empty:
         closed = trades_df.copy()
 
-    n        = len(closed)
-    wins     = closed[closed["exit_type"] == "target"]
-    stops    = closed[closed["exit_type"] == "stop"]
-    timeouts = closed[closed["exit_type"] == "time"]
-    win_rate = len(wins) / n * 100 if n else 0
+    n         = len(closed)
+    wins      = closed[closed["exit_type"] == "target"]
+    stops     = closed[closed["exit_type"].isin(["stop", "stop_gap"])]
+    stop_gaps = closed[closed["exit_type"] == "stop_gap"]
+    timeouts  = closed[closed["exit_type"] == "time"]
+    win_rate  = len(wins) / n * 100 if n else 0
 
     gross_win  = wins["pnl_aud"].sum()
     gross_loss = stops["pnl_aud"].sum()
@@ -802,6 +845,7 @@ def calc_metrics(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> dict:
         "win_rate_pct":      round(win_rate, 1),
         "wins":              len(wins),
         "losses":            len(stops),
+        "stop_gaps":         len(stop_gaps),
         "time_stops":        len(timeouts),
         "profit_factor":     round(pf, 2) if not np.isnan(pf) else "n/a",
         "avg_r":             round(avg_r, 3),
@@ -834,6 +878,7 @@ def print_comparison(results: list[tuple[str, dict]]) -> None:
         ("win_rate_pct",      "Win rate %"),
         ("wins",              "  Targets"),
         ("losses",            "  Stops"),
+        ("stop_gaps",         "  Gap stops"),
         ("time_stops",        "  Time stops"),
         ("profit_factor",     "Profit factor"),
         ("avg_r",             "Avg R / trade"),
@@ -849,7 +894,7 @@ def print_comparison(results: list[tuple[str, dict]]) -> None:
         ("sharpe",            "Sharpe"),
         ("avg_hold_days",     "Avg hold days"),
     ]
-    LOWER_IS_BETTER = {"losses", "time_stops", "max_drawdown_aud",
+    LOWER_IS_BETTER = {"losses", "stop_gaps", "time_stops", "max_drawdown_aud",
                        "max_drawdown_pct", "max_consec_losses"}
 
     labels = [lbl for lbl, _ in results]
@@ -858,8 +903,9 @@ def print_comparison(results: list[tuple[str, dict]]) -> None:
     sep    = "=" * (met_w + col_w * len(labels) + 4)
 
     print(f"\n{sep}")
-    print(f"  DEFINITIVE VALIDATION BACKTEST — 8-YEAR COMPARISON  ({date.today()})")
+    print(f"  REALISTIC COST IMPACT — 8-YEAR COMPARISON  ({date.today()})")
     print(f"  ${STARTING_BALANCE:,} start | {RISK_PCT*100:.1f}% risk/trade | max {MAX_POSITIONS} positions")
+    print(f"  RS top 20% + >=2 triggers | flat sizing | entry at next-day open")
     print(sep)
 
     hdr = f"  {'Metric':<{met_w}}"
@@ -1002,9 +1048,11 @@ def save_comparison_chart(results: list[tuple[str, dict]],
         else:
             xs  = np.array([0, 1])
             mtm = np.array([STARTING_BALANCE, STARTING_BALANCE])
-        final  = m.get("final_account", STARTING_BALANCE)
-        ret    = m.get("pct_return", 0)
-        lbl    = f"{label}  (${final:,.0f} | {ret:+.1f}%)"
+        final      = m.get("final_account", STARTING_BALANCE)
+        ret        = m.get("pct_return", 0)
+        # Escape $ so matplotlib's mathtext parser treats it as a literal character
+        label_safe = label.replace("$", r"\$")
+        lbl        = f"{label_safe}  (A\\${final:,.0f} | {ret:+.1f}%)"
         ax_eq.plot(xs, mtm, color=colour, lw=1.6, label=lbl, zorder=3)
 
     ax_eq.axhline(STARTING_BALANCE, color=GREY, lw=0.8, ls="--", alpha=0.5)
@@ -1101,8 +1149,9 @@ def save_comparison_chart(results: list[tuple[str, dict]],
     ax_stat.set_title("Summary Statistics", color="white", fontsize=10, pad=6)
 
     fig.text(0.5, 0.002,
-             f"Stop: {ATR_STOP_MULT}x ATR | Target: {TARGET_R}:1 | BE@1R | "
-             f"Time: {TIME_STOP_DAYS}d | Full system: min triggers/regime PSM/sector cap/risk floor",
+             f"Stop: {ATR_STOP_MULT}x ATR  |  Target: {TARGET_R}:1  |  BE@1R  |  "
+             f"Time: {TIME_STOP_DAYS}d  |  "
+             f"Realistic: IBKR $6/leg · 0.2% slippage · gap risk (open vs stop)",
              color=GREY, fontsize=7.5, ha="center")
 
     plt.savefig(out_path, dpi=130, bbox_inches="tight", facecolor=BG)
@@ -1170,20 +1219,28 @@ def main():
     all_results: list[tuple[str, dict]] = []
     all_equity:  list[pd.DataFrame] = []
 
-    print("Step 4/4  Building shared signal pool (RS top 20% + >=2 triggers) ...")
+    print("Step 4/6  Building shared signal pool (RS top 20% + >=2 triggers) ...")
     ind, by_entry = _build_signal_pool(price_data, xjo_close, min_triggers=2)
     print()
 
-    # A: full size (PSM=1.0 always)
-    # B: identical trades, position size scaled by regime PSM on entry date
+    # Scenario A — Idealized: $10 round-trip commission, no slippage, no gap risk
+    #   Matches the original backtest assumptions (theoretical upper bound)
+    # Scenario B — Realistic: IBKR $6/leg, 0.2% slippage on every fill, gap risk
+    #   Both use identical flat 1.5% sizing (PSM=1.0, regime informational only)
     scenarios = [
-        ("RS + 2 triggers  [full size, no regime]",  None),
-        ("RS + 2 triggers  [regime PSM scaling]",    regime_series),
+        (
+            "Idealized  ($10 comm, 0% slip)",
+            dict(comm_entry=0.0, comm_exit=10.0, slippage=0.0,   gap_risk=False),
+        ),
+        (
+            "Realistic  (IBKR $6/leg, 0.2% slip, gap risk)",
+            dict(comm_entry=6.0, comm_exit=6.0,  slippage=0.002, gap_risk=True),
+        ),
     ]
 
-    for sc_label, psm_ser in scenarios:
+    for sc_label, sc_params in scenarios:
         print(f"Running: {sc_label} ...")
-        trades_df, equity_df = _simulate(ind, by_entry, psm_series=psm_ser)
+        trades_df, equity_df = _simulate(ind, by_entry, psm_series=None, **sc_params)
 
         if trades_df.empty:
             print("  No trades generated!")
@@ -1193,13 +1250,15 @@ def main():
         all_results.append((sc_label, m))
         all_equity.append(equity_df)
 
+        gap_str = f" | gap stops {m.get('stop_gaps', 0)}" if sc_params["gap_risk"] else ""
         print(f"  {m['total_trades']} trades  |  "
               f"win {m['win_rate_pct']}%  |  "
               f"PF {m['profit_factor']}  |  "
               f"return {m.get('pct_return','n/a')}%  |  "
-              f"CAGR {m.get('cagr_pct','n/a')}%")
+              f"CAGR {m.get('cagr_pct','n/a')}%{gap_str}")
 
-        slug = sc_label.lower().replace(" ", "_")[:30].rstrip("_").replace("[","").replace("]","")
+        import re as _re
+        slug = _re.sub(r"[^a-z0-9]+", "_", sc_label.lower()).strip("_")[:30].rstrip("_")
         trades_df.to_csv(RESULTS_DIR / f"trades_8y_{slug}_{today_str}.csv", index=False)
         equity_df.to_csv(RESULTS_DIR / f"equity_8y_{slug}_{today_str}.csv", index=False)
         print()
