@@ -413,8 +413,12 @@ def compute_indicators(df: pd.DataFrame, xjo_close: pd.Series,
     return d
 
 
-def find_signals(d: pd.DataFrame) -> pd.Series:
-    """Hard screener filters — same as live screener."""
+def find_signals(d: pd.DataFrame,
+                 min_atr_pct: float = MIN_ATR_PCT) -> pd.Series:
+    """Hard screener filters — same as live screener.
+
+    min_atr_pct can be overridden per scenario (e.g. 4.0 for the tighter filter).
+    """
     return (
         (d["Close"]      >  MIN_PRICE)     &
         (d["Close"]      <= MAX_PRICE)     &
@@ -424,7 +428,7 @@ def find_signals(d: pd.DataFrame) -> pd.Series:
         (d["ema50_dist"] <= MAX_EMA50_DIST) &
         (d["rsi"]        >= RSI_MIN)       &
         (d["rsi"]        <= RSI_MAX)       &
-        (d["atr_pct"]    >= MIN_ATR_PCT)   &
+        (d["atr_pct"]    >= min_atr_pct)   &
         (d["rs_vs_xjo"]  >  0)            &
         (d["xjo_uptrend"] == True)
     )
@@ -436,11 +440,17 @@ def find_signals(d: pd.DataFrame) -> pd.Series:
 
 def _build_signal_pool(price_data: dict[str, pd.DataFrame],
                        xjo_close: pd.Series,
-                       min_triggers: int = 2) -> tuple[dict, dict]:
+                       min_triggers: int = 2,
+                       min_atr_pct:  float = MIN_ATR_PCT,
+                       entry_at_close: bool = False) -> tuple[dict, dict]:
     """
-    Shared pre-scan used by both scenarios.
-    Returns (ind, by_entry) — indicators and RS top-20% + min_triggers signal pool.
-    XJO uptrend gate is always True so regime doesn't filter at scan time.
+    Pre-scan signal pool for a scenario.
+
+    Parameters
+    ----------
+    min_atr_pct     : ATR% floor at signal time (default 3.0; tighter = 4.0).
+    entry_at_close  : if True, fill at signal-bar Close (3:30pm proxy) instead
+                      of next-day Open.  Both still apply slippage in _simulate.
     """
     xjo_uptrend = pd.Series(True, index=xjo_close.index)
 
@@ -456,12 +466,14 @@ def _build_signal_pool(price_data: dict[str, pd.DataFrame],
     rs_pct80 = {dt: float(np.percentile(vals, 80))
                 for dt, vals in date_rs.items() if len(vals) >= 5}
 
-    print(f"  Scanning signals (RS top 20% + >={min_triggers} triggers) ...")
+    entry_desc = "signal-day close" if entry_at_close else "next-day open"
+    print(f"  Scanning (RS top 20% + >={min_triggers} triggers, "
+          f"ATR>={min_atr_pct}%, entry={entry_desc}) ...")
     by_entry: dict = defaultdict(list)
     for ticker, d in ind.items():
-        sigs = find_signals(d)
+        sigs = find_signals(d, min_atr_pct=min_atr_pct)
         n    = len(d)
-        for i in range(WARMUP, n - 1):
+        for i in range(WARMUP, n - 1):   # n-1 keeps a buffer on both paths
             if not sigs.iloc[i]:
                 continue
             rv  = float(d["rs_vs_xjo"].values[i])
@@ -471,11 +483,20 @@ def _build_signal_pool(price_data: dict[str, pd.DataFrame],
             tc  = int(d["trigger_count"].values[i])
             if tc < min_triggers:
                 continue
-            ep  = float(d["Open"].values[i + 1])
             atr = float(d["atr"].values[i])
-            if ep <= 0 or atr <= 0:
+            if atr <= 0:
                 continue
-            by_entry[d.index[i + 1]].append({
+            if entry_at_close:
+                # Fill at today's close — proxy for a 3:30pm market order
+                ep       = float(d["Close"].values[i])
+                entry_dt = d.index[i]
+            else:
+                # Fill at next day's open — standard overnight entry
+                ep       = float(d["Open"].values[i + 1])
+                entry_dt = d.index[i + 1]
+            if ep <= 0:
+                continue
+            by_entry[entry_dt].append({
                 "ticker": ticker, "entry_open": ep, "atr": atr,
                 "rs_val": rv, "trigger_count": tc,
             })
@@ -903,9 +924,9 @@ def print_comparison(results: list[tuple[str, dict]]) -> None:
     sep    = "=" * (met_w + col_w * len(labels) + 4)
 
     print(f"\n{sep}")
-    print(f"  REALISTIC COST IMPACT — 8-YEAR COMPARISON  ({date.today()})")
+    print(f"  8-YEAR PARAMETER COMPARISON  ({date.today()})")
     print(f"  ${STARTING_BALANCE:,} start | {RISK_PCT*100:.1f}% risk/trade | max {MAX_POSITIONS} positions")
-    print(f"  RS top 20% + >=2 triggers | flat sizing | entry at next-day open")
+    print(f"  All scenarios: RS top 20% + >=2 triggers | flat sizing | IBKR $6/leg | 0.2% slip | gap risk")
     print(sep)
 
     hdr = f"  {'Metric':<{met_w}}"
@@ -1215,32 +1236,40 @@ def main():
         print("ERROR: No price data downloaded. Check network.")
         sys.exit(1)
 
-    # ── 4. Build shared signal pool & run scenarios ──────────────────────────
+    # ── 4. Build signal pools (one per scenario — they differ in ATR threshold
+    #        and entry timing, so they cannot share a pool) ─────────────────────
     all_results: list[tuple[str, dict]] = []
     all_equity:  list[pd.DataFrame] = []
 
-    print("Step 4/6  Building shared signal pool (RS top 20% + >=2 triggers) ...")
-    ind, by_entry = _build_signal_pool(price_data, xjo_close, min_triggers=2)
-    print()
+    import re as _re
 
-    # Scenario A — Idealized: $10 round-trip commission, no slippage, no gap risk
-    #   Matches the original backtest assumptions (theoretical upper bound)
-    # Scenario B — Realistic: IBKR $6/leg, 0.2% slippage on every fill, gap risk
-    #   Both use identical flat 1.5% sizing (PSM=1.0, regime informational only)
-    scenarios = [
+    # Both scenarios use the same realistic cost model
+    realistic = dict(comm_entry=6.0, comm_exit=6.0, slippage=0.002, gap_risk=True)
+
+    # Scenario A — Realistic baseline (from previous run)
+    #   ATR >= 3%  |  entry at next-day open
+    # Scenario B — Both improvements combined
+    #   ATR >= 4%  |  entry at signal-day close (3:30pm proxy)
+    pool_configs = [
         (
-            "Idealized  ($10 comm, 0% slip)",
-            dict(comm_entry=0.0, comm_exit=10.0, slippage=0.0,   gap_risk=False),
+            "Realistic baseline  (ATR 3%, next-day open)",
+            dict(min_atr_pct=3.0, entry_at_close=False),
         ),
         (
-            "Realistic  (IBKR $6/leg, 0.2% slip, gap risk)",
-            dict(comm_entry=6.0, comm_exit=6.0,  slippage=0.002, gap_risk=True),
+            "Both improvements  (ATR 4%, signal-day close)",
+            dict(min_atr_pct=4.0, entry_at_close=True),
         ),
     ]
 
-    for sc_label, sc_params in scenarios:
-        print(f"Running: {sc_label} ...")
-        trades_df, equity_df = _simulate(ind, by_entry, psm_series=None, **sc_params)
+    for sc_label, pool_params in pool_configs:
+        print(f"Step 4/6  Building signal pool: {sc_label} ...")
+        ind, by_entry = _build_signal_pool(
+            price_data, xjo_close, min_triggers=2, **pool_params
+        )
+        print()
+
+        print(f"Running simulation: {sc_label} ...")
+        trades_df, equity_df = _simulate(ind, by_entry, psm_series=None, **realistic)
 
         if trades_df.empty:
             print("  No trades generated!")
@@ -1250,14 +1279,13 @@ def main():
         all_results.append((sc_label, m))
         all_equity.append(equity_df)
 
-        gap_str = f" | gap stops {m.get('stop_gaps', 0)}" if sc_params["gap_risk"] else ""
         print(f"  {m['total_trades']} trades  |  "
               f"win {m['win_rate_pct']}%  |  "
               f"PF {m['profit_factor']}  |  "
               f"return {m.get('pct_return','n/a')}%  |  "
-              f"CAGR {m.get('cagr_pct','n/a')}%{gap_str}")
+              f"CAGR {m.get('cagr_pct','n/a')}%  |  "
+              f"gap stops {m.get('stop_gaps', 0)}")
 
-        import re as _re
         slug = _re.sub(r"[^a-z0-9]+", "_", sc_label.lower()).strip("_")[:30].rstrip("_")
         trades_df.to_csv(RESULTS_DIR / f"trades_8y_{slug}_{today_str}.csv", index=False)
         equity_df.to_csv(RESULTS_DIR / f"equity_8y_{slug}_{today_str}.csv", index=False)
