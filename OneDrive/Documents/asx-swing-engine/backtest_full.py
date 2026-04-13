@@ -97,8 +97,9 @@ BATCH_SIZE  = 20
 BATCH_DELAY = 1.0
 BENCHMARK   = "^AXJO"
 
-RESULTS_DIR      = Path("results/backtest")
-SECTOR_CACHE_PATH = Path("results/sector_cache.json")
+RESULTS_DIR        = Path("results/backtest")
+SECTOR_CACHE_PATH  = Path("results/sector_cache.json")
+EARNINGS_CACHE_PATH = Path("results/earnings_cache.json")
 
 # 40-stock ASX200 breadth sample (matches regime_detector.py)
 ASX200_SAMPLE = [
@@ -323,6 +324,17 @@ def build_regime_series(xjo_df: pd.DataFrame, period: str) -> pd.DataFrame:
         require_all  = dual_penalty or (regime == "CHOPPY")
         min_trig     = 3 if require_all else 2
 
+        # ── Variant F: 3-state classification for regime-conditional momentum filter ──
+        # STRONG_BULL : XJO above 200 EMA AND breadth > 55%  → full size, no filter
+        # WEAK_BULL   : XJO above 200 EMA AND breadth 40-55% → 0.8× size, no filter
+        # CHOPPY_BEAR : breadth < 40% OR XJO below 200 EMA   → hard momentum filter
+        if a200 and brd > 55:
+            f_reg = "STRONG_BULL"
+        elif a200 and brd >= 40:
+            f_reg = "WEAK_BULL"
+        else:
+            f_reg = "CHOPPY_BEAR"
+
         rows.append({
             "date":                dt,
             "regime":              regime,
@@ -332,6 +344,7 @@ def build_regime_series(xjo_df: pd.DataFrame, period: str) -> pd.DataFrame:
             "min_triggers":        min_trig,
             "market_breadth":      brd,
             "blocked":             False,   # regime never blocks
+            "f_regime":            f_reg,
         })
 
     df = pd.DataFrame(rows).set_index("date")
@@ -340,6 +353,13 @@ def build_regime_series(xjo_df: pd.DataFrame, period: str) -> pd.DataFrame:
     psm_dist = df.groupby("psm").size().sort_index()
     print(f"  PSM distribution: {dict(psm_dist)}")
     print(f"  Avg PSM across period: {df['psm'].mean():.3f}")
+    # F-variant distribution
+    frc = df["f_regime"].value_counts()
+    total_days = len(df)
+    print(f"  F-regime distribution (trading days):")
+    for fr in ["STRONG_BULL", "WEAK_BULL", "CHOPPY_BEAR"]:
+        n = int(frc.get(fr, 0))
+        print(f"    {fr:<14} {n:>5} days  ({n/total_days*100:.1f}%)")
     return df
 
 
@@ -383,6 +403,68 @@ def fetch_sector_map(tickers: list[str]) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Earnings calendar — fetch and cache per-ticker earnings dates
+# ---------------------------------------------------------------------------
+
+def fetch_earnings_map(tickers: list[str]) -> dict[str, set]:
+    """Return {ticker: set_of_date_strings} for earnings dates (YYYY-MM-DD).
+
+    Uses/updates results/earnings_cache.json.  Tickers with no available data
+    return an empty set — the filter is simply skipped for those tickers.
+    Delete the cache file to force a full refresh.
+    """
+    cache: dict[str, list] = {}
+    if EARNINGS_CACHE_PATH.exists():
+        try:
+            with open(EARNINGS_CACHE_PATH) as fh:
+                cache = json.load(fh)
+        except Exception:
+            pass
+
+    missing = [t for t in tickers if t not in cache]
+    if missing:
+        print(f"  Fetching earnings calendar for {len(missing)} tickers "
+              f"({EARNINGS_CACHE_PATH.name}) ...")
+        for i, ticker in enumerate(missing, 1):
+            dates: list[str] = []
+            try:
+                with _quiet():
+                    ed = yf.Ticker(ticker).earnings_dates
+                if ed is not None and not ed.empty:
+                    for dt_idx in ed.index:
+                        try:
+                            ts = pd.Timestamp(dt_idx)
+                            # Normalise tz-aware → date string, tolerant of any tz
+                            if ts.tzinfo is not None:
+                                ts = ts.tz_convert(None)
+                            dates.append(str(ts.date()))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            cache[ticker] = dates
+            if i % 20 == 0 or i == len(missing):
+                print(f"    {i}/{len(missing)} done ...")
+            time.sleep(0.05)
+
+        try:
+            EARNINGS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(EARNINGS_CACHE_PATH, "w") as fh:
+                json.dump(cache, fh, indent=2)
+            n_with_data = sum(1 for v in cache.values() if v)
+            print(f"  Earnings cache saved — {n_with_data}/{len(cache)} tickers "
+                  f"have date data.")
+        except Exception as exc:
+            print(f"  WARNING: could not save earnings cache: {exc}")
+    else:
+        n_with_data = sum(1 for v in cache.values() if v)
+        print(f"  Earnings cache loaded — {n_with_data}/{len(cache)} tickers "
+              f"have date data.")
+
+    return {t: set(cache.get(t, [])) for t in tickers}
+
+
+# ---------------------------------------------------------------------------
 # Indicators
 # ---------------------------------------------------------------------------
 
@@ -402,6 +484,10 @@ def compute_indicators(df: pd.DataFrame, xjo_close: pd.Series,
     d["rs_vs_xjo"] = d["stock_r63"] - d["xjo_r63"]
     d["xjo_uptrend"] = xjo_uptrend.reindex(d.index, method="ffill").fillna(True)
 
+    # Momentum quality indicators (variant C)
+    d["roc_20"]     = d["Close"].pct_change(20)
+    d["ema50_slope"] = (d["ema50"] - d["ema50"].shift(5)) / d["ema50"].shift(5).replace(0, np.nan)
+
     # Entry triggers
     rsi_prev    = d["rsi"].shift(1)
     t_rsi       = (rsi_prev >= 40) & (rsi_prev <= 55) & (d["rsi"] > rsi_prev)
@@ -414,12 +500,16 @@ def compute_indicators(df: pd.DataFrame, xjo_close: pd.Series,
 
 
 def find_signals(d: pd.DataFrame,
-                 min_atr_pct: float = MIN_ATR_PCT) -> pd.Series:
+                 min_atr_pct:      float = MIN_ATR_PCT,
+                 min_dollar_vol:   float = 0.0,
+                 momentum_quality: bool  = False) -> pd.Series:
     """Hard screener filters — same as live screener.
 
-    min_atr_pct can be overridden per scenario (e.g. 4.0 for the tighter filter).
+    min_atr_pct      : ATR% floor, overridable per scenario.
+    min_dollar_vol   : minimum daily dollar value (Close × avg_vol_20).  0 = disabled.
+    momentum_quality : variant C — additionally require ROC(20) > 0 AND EMA50 slope > 0.
     """
-    return (
+    mask = (
         (d["Close"]      >  MIN_PRICE)     &
         (d["Close"]      <= MAX_PRICE)     &
         (d["avg_vol"]    >  MIN_AVG_VOL_20) &
@@ -432,6 +522,12 @@ def find_signals(d: pd.DataFrame,
         (d["rs_vs_xjo"]  >  0)            &
         (d["xjo_uptrend"] == True)
     )
+    if min_dollar_vol > 0:
+        mask = mask & (d["Close"] * d["avg_vol"] >= min_dollar_vol)
+    if momentum_quality:
+        # Both 20-day ROC and 5-bar EMA50 slope must be positive
+        mask = mask & (d["roc_20"] > 0) & (d["ema50_slope"] > 0)
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -440,17 +536,44 @@ def find_signals(d: pd.DataFrame,
 
 def _build_signal_pool(price_data: dict[str, pd.DataFrame],
                        xjo_close: pd.Series,
-                       min_triggers: int = 2,
-                       min_atr_pct:  float = MIN_ATR_PCT,
-                       entry_at_close: bool = False) -> tuple[dict, dict]:
+                       min_triggers:      int   = 2,
+                       min_atr_pct:       float = MIN_ATR_PCT,
+                       entry_at_close:    bool  = False,
+                       earnings_window:   int   = 0,
+                       earnings_map:      dict | None = None,
+                       min_dollar_vol:    float = 0.0,
+                       momentum_quality:  bool  = False,
+                       entry_discount_atr: float = 0.0,
+                       momentum_scale:    bool  = False,
+                       f_regime_series:   pd.Series | None = None) -> tuple[dict, dict]:
     """
     Pre-scan signal pool for a scenario.
 
     Parameters
     ----------
-    min_atr_pct     : ATR% floor at signal time (default 3.0; tighter = 4.0).
-    entry_at_close  : if True, fill at signal-bar Close (3:30pm proxy) instead
-                      of next-day Open.  Both still apply slippage in _simulate.
+    min_atr_pct        : ATR% floor at signal time (default 3.0; tighter = 4.0).
+    entry_at_close     : if True, fill at signal-bar Close (3:30pm proxy) instead
+                         of next-day Open.  Both still apply slippage in _simulate.
+    earnings_window    : skip signals within this many calendar days of an earnings
+                         announcement.  0 = disabled.
+    earnings_map       : {ticker: set_of_"YYYY-MM-DD"} from fetch_earnings_map().
+                         Required when earnings_window > 0.
+    min_dollar_vol     : minimum daily dollar volume (Close × avg_vol_20).  0 = off.
+    momentum_quality   : variant C — hard filter: require ROC(20)>0 AND EMA50 slope>0.
+    entry_discount_atr : variant D — limit entry at (close − n×ATR) on the NEXT bar.
+                         0.0 = disabled.  When set, entry_at_close is ignored.
+                         In _simulate, the fill is only taken if next-bar low ≤ limit.
+    momentum_scale     : variant E — soft scaler: all trades enter but risk is scaled.
+                         ROC(20)>0 AND EMA50 slope>0 → mom_scale=1.0 (full risk).
+                         Either condition fails → mom_scale=0.6 (60% risk).
+                         Stamped onto each candidate; applied in _simulate().
+    f_regime_series    : variant F — per-bar Series (indexed by date) from
+                         build_regime_series()["f_regime"].  Values:
+                           "STRONG_BULL"  → full size (1.0×), no momentum filter
+                           "WEAK_BULL"    → reduced size (0.8×), no momentum filter
+                           "CHOPPY_BEAR"  → hard momentum filter (ROC20>0 & EMA50
+                                            slope>0); filtered trades are dropped.
+                         Takes precedence over momentum_quality and momentum_scale.
     """
     xjo_uptrend = pd.Series(True, index=xjo_close.index)
 
@@ -466,12 +589,36 @@ def _build_signal_pool(price_data: dict[str, pd.DataFrame],
     rs_pct80 = {dt: float(np.percentile(vals, 80))
                 for dt, vals in date_rs.items() if len(vals) >= 5}
 
-    entry_desc = "signal-day close" if entry_at_close else "next-day open"
+    if entry_discount_atr > 0:
+        entry_desc = f"limit(close-{entry_discount_atr}xATR) next-day"
+    elif entry_at_close:
+        entry_desc = "signal-day close"
+    else:
+        entry_desc = "next-day open"
+    filters_desc = []
+    if f_regime_series is not None:
+        filters_desc.append("F-regime: STRONG_BULL→1.0x / WEAK_BULL→0.8x / CHOPPY_BEAR→hard-filter")
+    elif momentum_quality:
+        filters_desc.append("ROC20>0&EMA50slope>0 [hard]")
+    elif momentum_scale:
+        filters_desc.append("ROC20/EMA50slope→scale(1.0/0.6)")
+    if min_dollar_vol > 0:
+        filters_desc.append(f"$vol>=${min_dollar_vol/1e6:.0f}M")
+    if earnings_window > 0:
+        filters_desc.append(f"earnings±{earnings_window}d")
+    extra = f"\n    [{', '.join(filters_desc)}]" if filters_desc else ""
     print(f"  Scanning (RS top 20% + >={min_triggers} triggers, "
-          f"ATR>={min_atr_pct}%, entry={entry_desc}) ...")
+          f"ATR>={min_atr_pct}%, entry={entry_desc}){extra} ...")
+
+    skipped_earnings  = 0
+    skipped_liquidity = 0
+    skipped_f_filter  = 0
+    f_sig_counts: dict[str, int] = {"STRONG_BULL": 0, "WEAK_BULL": 0, "CHOPPY_BEAR": 0}
+
     by_entry: dict = defaultdict(list)
     for ticker, d in ind.items():
-        sigs = find_signals(d, min_atr_pct=min_atr_pct)
+        sigs = find_signals(d, min_atr_pct=min_atr_pct, min_dollar_vol=min_dollar_vol,
+                            momentum_quality=momentum_quality)
         n    = len(d)
         for i in range(WARMUP, n - 1):   # n-1 keeps a buffer on both paths
             if not sigs.iloc[i]:
@@ -486,23 +633,100 @@ def _build_signal_pool(price_data: dict[str, pd.DataFrame],
             atr = float(d["atr"].values[i])
             if atr <= 0:
                 continue
-            if entry_at_close:
-                # Fill at today's close — proxy for a 3:30pm market order
+
+            # ── Entry price / timing ──────────────────────────────────────────
+            limit_order = False
+            if entry_discount_atr > 0:
+                # Variant D: limit order at close − n×ATR, checked vs next bar low
+                ep          = float(d["Close"].values[i]) - entry_discount_atr * atr
+                entry_dt    = d.index[i + 1]
+                limit_order = True
+            elif entry_at_close:
+                # Standard close entry (3:30pm proxy)
                 ep       = float(d["Close"].values[i])
                 entry_dt = d.index[i]
             else:
-                # Fill at next day's open — standard overnight entry
+                # Next-day open (overnight entry)
                 ep       = float(d["Open"].values[i + 1])
                 entry_dt = d.index[i + 1]
             if ep <= 0:
                 continue
+
+            # Earnings filter: skip if entry falls within earnings_window of any
+            # known announcement.  Where no earnings data exists, let it through.
+            if earnings_window > 0 and earnings_map is not None:
+                ticker_dates = earnings_map.get(ticker, set())
+                if ticker_dates:   # only filter when we actually have data
+                    entry_pd = pd.Timestamp(entry_dt)
+                    near_earnings = False
+                    for ed_str in ticker_dates:
+                        try:
+                            if abs((entry_pd - pd.Timestamp(ed_str)).days) <= earnings_window:
+                                near_earnings = True
+                                break
+                        except Exception:
+                            pass
+                    if near_earnings:
+                        skipped_earnings += 1
+                        continue
+
+            # ── Risk scale / momentum filter ──────────────────────────────────
+            if f_regime_series is not None:
+                # Variant F: regime-conditional sizing + hard filter
+                sig_dt = d.index[i]
+                f_reg  = (f_regime_series.loc[sig_dt]
+                          if sig_dt in f_regime_series.index
+                          else "STRONG_BULL")
+                if f_reg == "STRONG_BULL":
+                    ms = 1.0   # full size, no filter
+                elif f_reg == "WEAK_BULL":
+                    ms = 0.8   # reduced size, no filter
+                else:          # CHOPPY_BEAR — hard momentum gate
+                    roc20_v = d["roc_20"].values[i]
+                    slop_v  = d["ema50_slope"].values[i]
+                    mom_ok  = (not np.isnan(roc20_v) and roc20_v > 0 and
+                               not np.isnan(slop_v)  and slop_v  > 0)
+                    if not mom_ok:
+                        skipped_f_filter += 1
+                        continue
+                    ms = 1.0   # passed filter, full size
+                f_sig_counts[f_reg] = f_sig_counts.get(f_reg, 0) + 1
+            elif momentum_scale:
+                # Variant E: soft scaler — 1.0 if momentum quality met, else 0.6
+                roc20_v = d["roc_20"].values[i]
+                slop_v  = d["ema50_slope"].values[i]
+                mom_ok  = (not np.isnan(roc20_v) and roc20_v > 0 and
+                           not np.isnan(slop_v)  and slop_v  > 0)
+                ms = 1.0 if mom_ok else 0.6
+            else:
+                ms = 1.0
+
             by_entry[entry_dt].append({
-                "ticker": ticker, "entry_open": ep, "atr": atr,
-                "rs_val": rv, "trigger_count": tc,
+                "ticker":        ticker,
+                "entry_open":    ep,
+                "atr":           atr,
+                "rs_val":        rv,
+                "trigger_count": tc,
+                "limit_order":   limit_order,
+                "mom_scale":     ms,
             })
 
     total = sum(len(v) for v in by_entry.values())
-    print(f"  {total} signals in pool across {len(ind)} tickers.")
+    skip_msg = []
+    if skipped_earnings  > 0: skip_msg.append(f"{skipped_earnings} near-earnings")
+    if skipped_liquidity > 0: skip_msg.append(f"{skipped_liquidity} low-liquidity")
+    if skipped_f_filter  > 0: skip_msg.append(f"{skipped_f_filter} CHOPPY_BEAR momentum-blocked")
+    extra_skip = f"  ({', '.join(skip_msg)} skipped)" if skip_msg else ""
+    print(f"  {total} signals in pool across {len(ind)} tickers.{extra_skip}")
+    if f_regime_series is not None:
+        sb = f_sig_counts.get("STRONG_BULL", 0)
+        wb = f_sig_counts.get("WEAK_BULL",   0)
+        cb = f_sig_counts.get("CHOPPY_BEAR", 0)
+        tot_f = sb + wb + cb
+        print(f"  F-regime signal split: "
+              f"STRONG_BULL {sb} ({sb/tot_f*100:.0f}%)  "
+              f"WEAK_BULL {wb} ({wb/tot_f*100:.0f}%)  "
+              f"CHOPPY_BEAR {cb} passed / {skipped_f_filter} blocked")
     return ind, by_entry
 
 
@@ -539,7 +763,9 @@ def _simulate(ind: dict[str, pd.DataFrame],
               comm_entry: float = 0.0,
               comm_exit:  float = 10.0,
               slippage:   float = 0.0,
-              gap_risk:   bool  = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+              gap_risk:   bool  = False,
+              stop_mult:  float = ATR_STOP_MULT,
+              target_r:   float = TARGET_R) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Core simulation loop.
 
@@ -556,6 +782,10 @@ def _simulate(ind: dict[str, pd.DataFrame],
                   For target exits, fill is at target_price * (1 - slippage).
     gap_risk    : if True, check each bar's open against the stop before intraday checks.
                   If open <= stop, exit at open * (1 - slippage) as 'stop_gap'.
+    stop_mult   : ATR multiplier for initial stop distance (default ATR_STOP_MULT=2.0).
+    target_r    : R-multiple for target distance.  target = entry + target_r * initial_risk.
+                  Default TARGET_R=2.0 → target = entry + 2×(2×ATR) = entry + 4×ATR.
+                  For variant B (2.5×ATR stop, 4×ATR target): target_r = 4/2.5 = 1.6.
     """
     all_dates = sorted(set().union(*[set(d.index) for d in ind.values()]))
     date_to_i = {dt: i for i, dt in enumerate(all_dates)}
@@ -683,11 +913,22 @@ def _simulate(ind: dict[str, pd.DataFrame],
             if risk_aud_bar < MIN_RISK_AUD:
                 continue
 
-            ep           = cand["entry_open"]
+            ep  = cand["entry_open"]
+            atr = cand["atr"]
+
+            # Variant D: limit order — only fill if today's low reached the limit price
+            if cand.get("limit_order", False):
+                d_ticker = ind.get(ticker)
+                if d_ticker is None or dt not in d_ticker.index:
+                    continue
+                if float(d_ticker["Low"].loc[dt]) > ep:
+                    continue   # limit not triggered today — skip
+
             ep_filled    = ep * (1.0 + slippage)   # adverse slippage on buy
-            atr          = cand["atr"]
-            initial_risk = atr * ATR_STOP_MULT      # dollar risk/share (ATR-based)
-            shares       = int(risk_aud_bar / initial_risk)
+            initial_risk = atr * stop_mult          # dollar risk/share (ATR-based)
+            # Variant E: soft momentum scaler — reduce position size when quality is low
+            risk_scaled  = risk_aud_bar * cand.get("mom_scale", 1.0)
+            shares       = int(risk_scaled / initial_risk)
             if shares == 0:
                 continue
 
@@ -698,11 +939,11 @@ def _simulate(ind: dict[str, pd.DataFrame],
                 "entry":        ep_filled,
                 "shares":       shares,
                 "initial_risk": initial_risk,
-                "risk_aud":     risk_aud_bar,
+                "risk_aud":     risk_scaled,
                 "psm":          psm_now,
                 "regime":       regime_now,
                 "stop":         ep_filled - initial_risk,
-                "target":       ep_filled + TARGET_R * initial_risk,
+                "target":       ep_filled + target_r * initial_risk,
                 "be_lvl":       ep_filled + BREAKEVEN_R * initial_risk,
                 "be_set":       False,
                 "bars_held":    0,
@@ -926,7 +1167,7 @@ def print_comparison(results: list[tuple[str, dict]]) -> None:
     print(f"\n{sep}")
     print(f"  8-YEAR PARAMETER COMPARISON  ({date.today()})")
     print(f"  ${STARTING_BALANCE:,} start | {RISK_PCT*100:.1f}% risk/trade | max {MAX_POSITIONS} positions")
-    print(f"  All scenarios: RS top 20% + >=2 triggers | flat sizing | IBKR $6/leg | 0.2% slip | gap risk")
+    print(f"  All: RS top 20% + >=2 triggers | flat sizing | IBKR $6/leg | 0.2% slip | gap risk | ATR>=3.5%")
     print(sep)
 
     hdr = f"  {'Metric':<{met_w}}"
@@ -1170,9 +1411,10 @@ def save_comparison_chart(results: list[tuple[str, dict]],
     ax_stat.set_title("Summary Statistics", color="white", fontsize=10, pad=6)
 
     fig.text(0.5, 0.002,
-             f"Stop: {ATR_STOP_MULT}x ATR  |  Target: {TARGET_R}:1  |  BE@1R  |  "
-             f"Time: {TIME_STOP_DAYS}d  |  "
-             f"Realistic: IBKR $6/leg · 0.2% slippage · gap risk (open vs stop)",
+             f"BE@1R  |  Time: {TIME_STOP_DAYS}d  |  "
+             r"IBKR \$6/leg · 0.2% slippage · gap risk  |  ATR>=3.5%  |  close entry  |  "
+             r"C: hard-block ROC20<=0/EMA50slope<=0  |  "
+             r"F: STRONG_BULL 1.0x, WEAK_BULL 0.8x, CHOPPY_BEAR hard-filter",
              color=GREY, fontsize=7.5, ha="center")
 
     plt.savefig(out_path, dpi=130, bbox_inches="tight", facecolor=BG)
@@ -1236,40 +1478,70 @@ def main():
         print("ERROR: No price data downloaded. Check network.")
         sys.exit(1)
 
-    # ── 4. Build signal pools (one per scenario — they differ in ATR threshold
-    #        and entry timing, so they cannot share a pool) ─────────────────────
+    # ── 4. Fetch earnings calendar (used in improved scenario) ───────────────────
+    tickers_all = list(price_data.keys())
+    print(f"Step 4/6  Fetching earnings calendar ({len(tickers_all)} tickers) ...")
+    earnings_map = fetch_earnings_map(tickers_all)
+    print()
+
+    # ── 5. Build signal pools (one per scenario — params differ so pools differ) ─
     all_results: list[tuple[str, dict]] = []
     all_equity:  list[pd.DataFrame] = []
 
     import re as _re
 
-    # Both scenarios use the same realistic cost model
-    realistic = dict(comm_entry=6.0, comm_exit=6.0, slippage=0.002, gap_risk=True)
+    # All scenarios: IBKR $6/leg · 0.2% slippage · gap risk · ATR>=3.5% · $20k start
+    realistic_costs = dict(comm_entry=6.0, comm_exit=6.0, slippage=0.002, gap_risk=True)
 
-    # Scenario A — Realistic baseline (from previous run)
-    #   ATR >= 3%  |  entry at next-day open
-    # Scenario B — Both improvements combined
-    #   ATR >= 4%  |  entry at signal-day close (3:30pm proxy)
-    pool_configs = [
-        (
-            "Realistic baseline  (ATR 3%, next-day open)",
-            dict(min_atr_pct=3.0, entry_at_close=False),
-        ),
-        (
-            "Both improvements  (ATR 4%, signal-day close)",
-            dict(min_atr_pct=4.0, entry_at_close=True),
-        ),
+    # ── F-regime series (per-bar 3-state classification) ─────────────────────
+    f_regime_series = regime_series["f_regime"]
+
+    # Print trading-day breakdown for the 8-year window
+    print("\n  F-REGIME TRADING-DAY BREAKDOWN (full 8-year window):")
+    frc = f_regime_series.value_counts()
+    total_td = len(f_regime_series)
+    for fr in ["STRONG_BULL", "WEAK_BULL", "CHOPPY_BEAR"]:
+        n = int(frc.get(fr, 0))
+        print(f"    {fr:<14} {n:>5} days  ({n/total_td*100:.1f}%)")
+    print()
+
+    # ── Scenario definitions ──────────────────────────────────────────────────
+    # A  Control         — full risk on every trade, no momentum filter
+    # C  Momentum hard   — block trades where ROC20<=0 or EMA50 slope<=0
+    # F  Regime-cond.    — STRONG_BULL 1.0×, WEAK_BULL 0.8×, CHOPPY_BEAR hard-filter
+    scenarios = [
+        {
+            "label":       "A  Control  (full risk, no filter)",
+            "pool_params": dict(min_atr_pct=3.5, entry_at_close=True),
+            "sim_params":  dict(stop_mult=2.0, target_r=2.0),
+        },
+        {
+            "label":       "C  Momentum hard-filter  (ROC20>0 & EMA50 slope>0)",
+            "pool_params": dict(min_atr_pct=3.5, entry_at_close=True,
+                                momentum_quality=True),
+            "sim_params":  dict(stop_mult=2.0, target_r=2.0),
+        },
+        {
+            "label":       "F  Regime-conditional  (SB=1.0x / WB=0.8x / CB=hard)",
+            "pool_params": dict(min_atr_pct=3.5, entry_at_close=True,
+                                f_regime_series=f_regime_series),
+            "sim_params":  dict(stop_mult=2.0, target_r=2.0),
+        },
     ]
 
-    for sc_label, pool_params in pool_configs:
-        print(f"Step 4/6  Building signal pool: {sc_label} ...")
+    for sc in scenarios:
+        sc_label = sc["label"]
+        print(f"Step 5/6  Building signal pool: {sc_label} ...")
         ind, by_entry = _build_signal_pool(
-            price_data, xjo_close, min_triggers=2, **pool_params
+            price_data, xjo_close, min_triggers=2, **sc["pool_params"]
         )
         print()
 
         print(f"Running simulation: {sc_label} ...")
-        trades_df, equity_df = _simulate(ind, by_entry, psm_series=None, **realistic)
+        trades_df, equity_df = _simulate(
+            ind, by_entry, psm_series=None,
+            **realistic_costs, **sc["sim_params"]
+        )
 
         if trades_df.empty:
             print("  No trades generated!")
@@ -1292,6 +1564,7 @@ def main():
         print()
 
     # ── Output ────────────────────────────────────────────────────────────────
+    print("Step 6/6  Generating comparison ...")
     if all_results:
         print_comparison(all_results)
         save_comparison_chart(

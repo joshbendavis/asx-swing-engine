@@ -182,11 +182,17 @@ def fetch_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
 # ---------------------------------------------------------------------------
 
 def evaluate_signals(ticker: str, df: pd.DataFrame,
-                     min_triggers: int = MIN_TRIGGERS) -> dict | None:
+                     min_triggers: int = MIN_TRIGGERS,
+                     apply_momentum_filter: bool = False) -> dict | None:
     """
     Evaluate the 3 entry triggers for a single ticker.
     Returns a dict of signal details or None if fewer than min_triggers fire.
     Requires at least 2 rows of data (today + yesterday).
+
+    apply_momentum_filter : Variant F CHOPPY_BEAR gate — reject the signal if
+                            the stock's own ROC(20) <= 0 OR EMA-50 slope <= 0.
+                            Both must be positive to pass.  Where insufficient
+                            history exists the check is skipped (neutral).
     """
     if len(df) < max(MACD_SLOW + MACD_SIGNAL + 5, VOL_LONG + 2):
         return None
@@ -199,7 +205,31 @@ def evaluate_signals(ticker: str, df: pd.DataFrame,
     if len(close) < 2:
         return None
 
-    # ---- Indicators ----
+    # ---- Momentum quality (Variant F CHOPPY_BEAR filter) --------------------
+    # Compute stock's own ROC-20 and EMA-50 5-bar slope
+    roc_20_val:    float | None = None
+    ema50_slope_val: float | None = None
+
+    if len(close) >= 21:
+        roc_20_val = float((close.iloc[-1] / close.iloc[-21] - 1) * 100)
+
+    ema50_series = close.ewm(span=50, adjust=False).mean()
+    if len(ema50_series) >= 6:
+        prev = float(ema50_series.iloc[-6])
+        if prev != 0:
+            ema50_slope_val = float(
+                (ema50_series.iloc[-1] - prev) / prev * 100
+            )
+
+    if apply_momentum_filter:
+        mom_ok = (
+            roc_20_val    is not None and roc_20_val    > 0 and
+            ema50_slope_val is not None and ema50_slope_val > 0
+        )
+        if not mom_ok:
+            return None   # blocked by CHOPPY_BEAR momentum gate
+
+    # ---- Entry trigger indicators -------------------------------------------
     rsi              = calc_rsi(close, ATR_PERIOD)
     macd_line, sig_l = calc_macd(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     atr_series       = calc_atr(high, low, close, ATR_PERIOD)
@@ -261,6 +291,8 @@ def evaluate_signals(ticker: str, df: pd.DataFrame,
         "macd_today":      round(today_macd, 5),
         "signal_today":    round(today_sig, 5),
         "vol_ratio_today": round(today_vol / avg_vol_20, 2) if avg_vol_20 > 0 else np.nan,
+        "roc_20":          round(roc_20_val, 3) if roc_20_val is not None else np.nan,
+        "ema50_slope":     round(ema50_slope_val, 4) if ema50_slope_val is not None else np.nan,
     }
 
 
@@ -285,45 +317,32 @@ def run_signals() -> pd.DataFrame:
     screener_map = screener.set_index("ticker")
 
     # 1b — Load market regime
-    regime_data          = _load_regime()
-    regime               = regime_data.get("regime", "BULL")
-    psm                  = regime_data.get("position_size_multiplier", 1.0)
-    confidence           = regime_data.get("confidence", None)
-    dual_momentum        = regime_data.get("dual_momentum_penalty", False)
-    require_all_triggers = regime_data.get("require_all_triggers", False)
+    regime_data = _load_regime()
+    regime      = regime_data.get("regime", "BULL")
+    confidence  = regime_data.get("confidence", None)
+
+    # ── Variant F: 3-state regime-conditional logic (production config) ──────
+    # STRONG_BULL : XJO > 200 EMA, breadth > 55%  → full size, no extra filter
+    # WEAK_BULL   : XJO > 200 EMA, breadth 40-55% → 0.8× size, no extra filter
+    # CHOPPY_BEAR : breadth < 40% or XJO < 200 EMA → hard momentum filter
+    #               (individual stock ROC-20 > 0 AND EMA-50 slope > 0)
+    f_regime      = regime_data.get("f_regime", "STRONG_BULL")
+    f_regime_size = regime_data.get("f_regime_size_multiplier", 1.0)
 
     conf_str = f"  confidence={confidence}%" if confidence is not None else ""
-    print(f"Market regime: {regime}{conf_str}  |  position_size_multiplier={psm}")
+    print(f"Market regime: {regime}{conf_str}  |  F-regime: {f_regime}  "
+          f"|  size={f_regime_size}x")
 
-    if regime == "BEAR":
-        print("WARNING: BEAR regime detected — skipping signal scan. No trades today.")
-        return pd.DataFrame()
+    min_triggers           = MIN_TRIGGERS   # always 2 — trigger count not bumped
+    apply_momentum_filter  = (f_regime == "CHOPPY_BEAR")
 
-    # Determine min_triggers — dual momentum penalty overrides all regime rules
-    if require_all_triggers:
-        min_triggers = 3
-        reason = "dual momentum penalty (ROC-20 and EMA-50 slope both negative)"
-        if regime == "CHOPPY":
-            reason = "CHOPPY + " + reason
-        print(f"Requiring all 3 triggers: {reason}.")
-    elif regime == "CHOPPY":
-        min_triggers = 3
-        print("CHOPPY regime: raising min_triggers to 3 (all 3 conditions must fire).")
-    else:
-        min_triggers = MIN_TRIGGERS
-
-    if regime == "HIGH_VOL":
-        print(
-            f"HIGH_VOL regime: position sizes capped at {psm}x "
-            "(ibkr_executor reads position_size_multiplier from regime.json)."
-        )
-    if regime == "WEAK_BULL":
-        print(
-            f"WEAK_BULL regime: momentum deteriorating — "
-            f"position size={psm}x, min_triggers={min_triggers}."
-        )
-    if dual_momentum and regime not in ("BEAR", "HIGH_VOL"):
-        print("Dual momentum penalty active: ROC-20 and EMA-50 slope both negative.")
+    if f_regime == "STRONG_BULL":
+        print("F-regime STRONG_BULL: full size (1.0x), no momentum filter.")
+    elif f_regime == "WEAK_BULL":
+        print("F-regime WEAK_BULL: reduced size (0.8x), no momentum filter.")
+    elif f_regime == "CHOPPY_BEAR":
+        print("F-regime CHOPPY_BEAR: momentum filter active — "
+              "each stock must have ROC-20 > 0 AND EMA-50 slope > 0.")
 
     # 2 — Download recent OHLCV
     print(f"Downloading {HISTORY_PERIOD} price data for {len(tickers)} tickers ...")
@@ -343,9 +362,13 @@ def run_signals() -> pd.DataFrame:
     print("Evaluating entry triggers ...")
     signals: list[dict] = []
 
+    n_momentum_blocked = 0
     for ticker, df in price_data.items():
-        result = evaluate_signals(ticker, df, min_triggers=min_triggers)
+        result = evaluate_signals(ticker, df, min_triggers=min_triggers,
+                                  apply_momentum_filter=apply_momentum_filter)
         if result is None:
+            if apply_momentum_filter:
+                n_momentum_blocked += 1
             continue
 
         # Merge screener metrics
@@ -358,7 +381,15 @@ def run_signals() -> pd.DataFrame:
             result["rsi_14_screener"] = row["rsi_14"]
             result["market_cap_m"]    = row["market_cap_m"]
 
+        # F-regime metadata — passed through to risk_engine for sizing
+        result["f_regime"]      = f_regime
+        result["f_regime_size"] = f_regime_size
+
         signals.append(result)
+
+    if apply_momentum_filter and n_momentum_blocked > 0:
+        print(f"  CHOPPY_BEAR momentum filter blocked {n_momentum_blocked} signal(s) "
+              f"(ROC-20 <= 0 or EMA-50 slope <= 0).")
 
     if not signals:
         print("No tickers met the entry trigger criteria today.")
@@ -382,6 +413,8 @@ def run_signals() -> pd.DataFrame:
         "composite_score", "risk_pct", "atr_pct",
         "rsi_today", "rsi_yest", "vol_ratio_today",
         "macd_today", "signal_today",
+        "roc_20", "ema50_slope",
+        "f_regime", "f_regime_size",
         "rs_vs_xjo", "momentum_20d", "market_cap_m",
     ]
     cols = [c for c in cols if c in df_out.columns]

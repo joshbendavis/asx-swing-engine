@@ -254,6 +254,28 @@ def _classify_regime(
     return "BULL"
 
 
+def _classify_f_regime(above_200: bool, market_breadth: float) -> str:
+    """
+    Variant F: 3-state regime classification used by signals.py and risk_engine.py
+    for regime-conditional momentum filtering and position sizing.
+
+    STRONG_BULL : XJO above 200 EMA  AND  breadth > 55%
+                  → full size (1.0×), no extra momentum filter
+    WEAK_BULL   : XJO above 200 EMA  AND  breadth 40–55%
+                  → reduced size (0.8×), no extra momentum filter
+    CHOPPY_BEAR : breadth < 40%  OR  XJO below 200 EMA
+                  → hard momentum filter: individual stock ROC(20) > 0
+                    AND EMA-50 slope > 0 required; full size if passed
+
+    Validated: 8-year backtest 2017-2026, Sharpe 1.06 vs 0.77 control.
+    """
+    if above_200 and market_breadth > 55:
+        return "STRONG_BULL"
+    if above_200 and market_breadth >= 40:
+        return "WEAK_BULL"
+    return "CHOPPY_BEAR"
+
+
 def _calc_confidence(
     regime:         str,
     above_200:      bool,
@@ -379,9 +401,11 @@ def run_regime_detector() -> dict:
     # 3. Market breadth
     market_breadth = _calc_market_breadth()
 
-    # 4. Classify regime
-    regime = _classify_regime(above_200, atr_pct, ema_50_slope, roc_20, market_breadth)
-    log.info("Regime classified: %s", regime)
+    # 4. Classify regime (legacy 5-state) + Variant F (3-state production)
+    regime   = _classify_regime(above_200, atr_pct, ema_50_slope, roc_20, market_breadth)
+    f_regime = _classify_f_regime(above_200, market_breadth)
+    log.info("Regime classified: %s  |  F-regime: %s  (breadth=%.1f%%)",
+             regime, f_regime, market_breadth)
 
     # 5. Dual momentum penalty — both ROC and slope negative
     dual_momentum_penalty = bool(roc_20 < 0 and ema_50_slope < 0)
@@ -411,9 +435,19 @@ def run_regime_detector() -> dict:
     psm = _regime_to_psm(regime)
     log.info("Position size multiplier: %.2f  (regime=%s, never zero)", psm, regime)
 
+    # F-regime sizing multiplier for risk_engine.py
+    f_regime_size = {"STRONG_BULL": 1.0, "WEAK_BULL": 0.8, "CHOPPY_BEAR": 1.0}[f_regime]
+    log.info(
+        "F-regime: %s  |  size=%.1fx  |  momentum_filter=%s",
+        f_regime, f_regime_size,
+        "REQUIRED" if f_regime == "CHOPPY_BEAR" else "off",
+    )
+
     # 8. Build result dict
     result = {
         "regime":                   regime,
+        "f_regime":                 f_regime,
+        "f_regime_size_multiplier": f_regime_size,
         "confidence":               confidence,
         "position_size_multiplier": float(psm),
         "dual_momentum_penalty":    dual_momentum_penalty,

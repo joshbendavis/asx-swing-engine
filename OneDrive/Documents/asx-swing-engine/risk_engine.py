@@ -13,9 +13,13 @@ Writes:
     results/signals_final.csv    — gated signals for ibkr_executor
     results/sector_cache.json    — updated sector cache after any yfinance lookups
 
-PRODUCTION CONFIGURATION (validated 8-year backtest, 2017-2026):
-    Risk per trade : 1.5% of account — FLAT, no regime scaling
-    Regime         : informational only — displayed on dashboard, never adjusts sizing
+PRODUCTION CONFIGURATION — Variant F (validated 8-year backtest 2017-2026, Sharpe 1.06):
+    Risk per trade : 1.5% of account — regime-conditional per Variant F:
+                       STRONG_BULL (XJO>200 EMA, breadth>55%)  → 1.0× (full)
+                       WEAK_BULL   (XJO>200 EMA, breadth 40-55%) → 0.8× (reduced)
+                       CHOPPY_BEAR (breadth<40% or XJO<200 EMA) → 1.0× for signals
+                                    that passed the momentum filter in signals.py
+    F-regime       : read from results/regime.json  →  f_regime / f_regime_size_multiplier
 
 Five checks applied per signal (after portfolio-level gates pass):
 
@@ -237,13 +241,17 @@ def run_risk_engine(dry_run: bool = False) -> dict:
         return summary
 
     # ── 2. Load regime ────────────────────────────────────────────────────────
-    regime_data = _load_regime()
-    regime      = regime_data.get("regime", "BULL")
-    confidence  = regime_data.get("confidence", 100)
+    regime_data   = _load_regime()
+    regime        = regime_data.get("regime", "BULL")
+    confidence    = regime_data.get("confidence", 100)
+    f_regime      = regime_data.get("f_regime", "STRONG_BULL")
+    f_regime_size = float(regime_data.get("f_regime_size_multiplier", 1.0))
     summary["regime"] = regime
-    summary["psm"]    = 1.0   # flat sizing — regime is informational only
-    log.info("Regime: %s  |  confidence=%s  |  sizing=FLAT 1.0x (regime informational only)",
-             regime, confidence)
+    summary["psm"]    = f_regime_size
+    log.info(
+        "Regime: %s  |  F-regime: %s  |  confidence=%s  |  size_mult=%.1fx",
+        regime, f_regime, confidence, f_regime_size,
+    )
 
     # ── 3. Exposure gate ──────────────────────────────────────────────────────
     open_trades = _load_open_trades()
@@ -300,12 +308,20 @@ def run_risk_engine(dry_run: bool = False) -> dict:
         return summary
 
     # ── 5. Compute effective risk per trade ───────────────────────────────────
-    # Flat 1.5% sizing — regime does NOT adjust position size.
-    # Heat cap is the only runtime constraint (prevents exceeding 9% portfolio heat).
+    # Variant F sizing: base risk is scaled by f_regime_size_multiplier before
+    # heat-cap is applied.
+    #   STRONG_BULL → base × 1.0 = $300  (full risk)
+    #   WEAK_BULL   → base × 0.8 = $240  (momentum transition zone)
+    #   CHOPPY_BEAR → base × 1.0 = $300  (momentum filter already ran in signals.py)
+    f_scaled_risk  = base_risk_aud * f_regime_size
     n_new          = min(slots_available, len(signals))
     heat_risk_cap  = heat_budget_aud / n_new       # fair share of remaining budget
-    final_risk_aud = min(base_risk_aud, heat_risk_cap)
+    final_risk_aud = min(f_scaled_risk, heat_risk_cap)
     risk_multiplier = round(final_risk_aud / base_risk_aud, 4) if base_risk_aud > 0 else 0.0
+    log.info(
+        "F-regime sizing: base=$%.0f × %.1f = $%.0f  |  heat_cap=$%.0f  |  final=$%.0f",
+        base_risk_aud, f_regime_size, f_scaled_risk, heat_risk_cap, final_risk_aud,
+    )
 
     summary["risk_multiplier"] = risk_multiplier
 

@@ -77,9 +77,9 @@ RSI_MAX            = 65
 MAX_EMA50_DIST_PCT = 10.0         # max % a stock can be above its 50 EMA
 
 ATR_PERIOD         = 14
-MIN_ATR_PCT        = 3.0          # hard floor — backtest shows edge only above 3%
-ATR_SWEET_MIN      = 3.0          # align scoring sweet spot with hard floor
-ATR_SWEET_MAX      = 4.0          # above: too volatile
+MIN_ATR_PCT        = 3.5          # hard floor — Variant F validation: edge above 3.5%
+ATR_SWEET_MIN      = 3.5          # align scoring sweet spot with hard floor
+ATR_SWEET_MAX      = 5.0          # above: too volatile
 ATR_SCORE_ZERO     = 8.0          # ATR% at which score hits 0 on the high side
 
 RS_PERIOD          = 63           # ~3 months
