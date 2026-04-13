@@ -20,6 +20,7 @@ Composite score (0–100), ranked descending:
 """
 
 import io
+import logging
 import os
 import sys
 import time
@@ -35,14 +36,26 @@ warnings.filterwarnings("ignore")
 
 
 @contextlib.contextmanager
-def _suppress_yf_noise():
-    """Suppress yfinance's delisted/failed-download stderr chatter."""
+def _suppress_yf_output():
+    """Suppress yfinance's delisted/failed-download noise from both channels:
+    - stderr  (direct print-style output)
+    - Python logging  (yfinance logs at ERROR through its own logger tree)
+    """
+    # ── stderr ───────────────────────────────────────────────────────────────
     with open(os.devnull, "w") as devnull:
-        old_stderr = sys.stderr
-        sys.stderr = devnull
+        old_stderr, sys.stderr = sys.stderr, devnull
+
+        # ── logging ───────────────────────────────────────────────────────────
+        yf_log = logging.getLogger("yfinance")
+        old_level, old_propagate = yf_log.level, yf_log.propagate
+        yf_log.setLevel(logging.CRITICAL)
+        yf_log.propagate = False
+
         try:
             yield
         finally:
+            yf_log.setLevel(old_level)
+            yf_log.propagate = old_propagate
             sys.stderr = old_stderr
 
 # ---------------------------------------------------------------------------
@@ -162,9 +175,15 @@ def percentile_rank(series: pd.Series) -> pd.Series:
 # Data fetching
 # ---------------------------------------------------------------------------
 
-def fetch_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
-    """Download OHLCV for a batch of tickers; return {ticker: DataFrame}."""
-    with _suppress_yf_noise():
+def fetch_batch(tickers: list[str], period: str) -> tuple[dict[str, pd.DataFrame], int]:
+    """Download OHLCV for a batch of tickers.
+
+    Returns
+    -------
+    result   : {ticker: DataFrame} for every ticker that returned data
+    n_failed : number of tickers with no data (delisted / suspended / bad symbol)
+    """
+    with _suppress_yf_output():
         raw = yf.download(
             tickers,
             period=period,
@@ -177,7 +196,7 @@ def fetch_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
     result: dict[str, pd.DataFrame] = {}
 
     if raw.empty:
-        return result
+        return result, len(tickers)
 
     if isinstance(raw.columns, pd.MultiIndex):
         # yfinance 1.x: columns are (field, ticker) when group_by is not set
@@ -193,7 +212,8 @@ def fetch_batch(tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
         if len(tickers) == 1:
             result[tickers[0]] = raw.dropna(how="all")
 
-    return result
+    n_failed = len(tickers) - len(result)
+    return result, n_failed
 
 
 def fetch_market_cap(ticker: str) -> float | None:
@@ -220,7 +240,7 @@ def run_screener() -> pd.DataFrame:
 
     # 2 — Benchmark (XJO) — one download, used for all RS calcs
     print(f"Downloading benchmark ({BENCHMARK}) ...")
-    with _suppress_yf_noise():
+    with _suppress_yf_output():
         xjo_raw = yf.download(BENCHMARK, period=HISTORY_PERIOD, interval="1d",
                               auto_adjust=True, progress=False)
     _xjo_close = xjo_raw["Close"]
@@ -234,14 +254,26 @@ def run_screener() -> pd.DataFrame:
     price_data: dict[str, pd.DataFrame] = {}
     batches = [tickers[i: i + BATCH_SIZE] for i in range(0, len(tickers), BATCH_SIZE)]
 
+    total_failed = 0
     for idx, batch in enumerate(batches, 1):
-        if idx % 10 == 0 or idx == len(batches):
-            print(f"  Batch {idx}/{len(batches)} ...")
-        price_data.update(fetch_batch(batch, HISTORY_PERIOD))
+        batch_result, n_failed = fetch_batch(batch, HISTORY_PERIOD)
+        price_data.update(batch_result)
+        total_failed += n_failed
+
+        # Print progress every 10 batches, on the last batch, or whenever any
+        # tickers failed — replacing dozens of per-ticker error lines with one summary.
+        if idx % 10 == 0 or idx == len(batches) or n_failed:
+            msg = f"  Batch {idx}/{len(batches)}"
+            if n_failed:
+                noun = "ticker" if n_failed == 1 else "tickers"
+                msg += f" — {n_failed} {noun} failed (delisted/suspended)"
+            print(msg)
+
         if idx < len(batches):
             time.sleep(BATCH_DELAY)
 
-    print(f"  Received price data for {len(price_data)} tickers.")
+    print(f"  Received price data for {len(price_data)} tickers "
+          f"({total_failed} failed across all batches).")
 
     # 4 — Technical filters + raw metric calculation
     candidates: list[dict] = []
