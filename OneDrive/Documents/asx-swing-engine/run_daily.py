@@ -67,6 +67,7 @@ from risk_engine import run_risk_engine
 from ibkr_executor import run_executor as ibkr_run
 from utils.charts import generate_charts
 from utils.emailer import send_email
+from utils.telegram_bot import send_daily_summary
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -91,6 +92,20 @@ def main() -> None:
     log.info("  ASX SWING ENGINE - daily run  %s", datetime.today().strftime("%d %b %Y %H:%M"))
     log.info("=" * 62)
 
+    # Context dict accumulated through the pipeline for Telegram summary at the end
+    _tg: dict = {
+        "run_date": datetime.today().strftime("%Y-%m-%d"),
+        "run_time": datetime.today().strftime("%H:%M"),
+        "steps":    {k: None for k in ["regime","screener","signals","risk","ibkr","exit_logger"]},
+        "screener_n": None,
+        "signals_n":  None,
+        "orders_n":   None,
+        "regime":     None,
+        "f_regime":   None,
+        "confidence": None,
+        "psm":        None,
+    }
+
     # ── 0. Regime detector ────────────────────────────────────────────────────
     log.info("Step 0/7 - Detecting market regime ...")
     try:
@@ -102,6 +117,11 @@ def main() -> None:
             "Regime: %s  |  confidence=%d%%  |  position_size_multiplier=%.2f",
             regime, confidence, psm,
         )
+        _tg["regime"]     = regime
+        _tg["f_regime"]   = regime_result.get("f_regime", regime)
+        _tg["confidence"] = confidence
+        _tg["psm"]        = psm
+        _tg["steps"]["regime"] = "ok"
         if regime == "BEAR":
             log.warning("BEAR regime — screener and signals will run but no orders will be placed.")
         elif regime == "HIGH_VOL":
@@ -111,6 +131,7 @@ def main() -> None:
     except Exception as exc:
         log.error("Regime detector failed: %s — defaulting to BULL (no restrictions).", exc)
         regime = "BULL"
+        _tg["steps"]["regime"] = "error"
         # Non-fatal: pipeline continues. regime.json may be stale or absent;
         # signals.py will fall back to BULL defaults automatically.
 
@@ -127,6 +148,8 @@ def main() -> None:
         sys.exit(0)
 
     log.info("Screener complete: %d stocks passed all filters.", len(results))
+    _tg["screener_n"] = len(results)
+    _tg["steps"]["screener"] = "ok"
 
     # Always save fresh CSV
     csv_path = Path("results") / "screener_output.csv"
@@ -146,14 +169,18 @@ def main() -> None:
             signals = run_signals()
             if signals.empty:
                 log.info("No entry signals today.")
+                _tg["signals_n"] = 0
             else:
                 log.info("%d signal(s) found.", len(signals))
+                _tg["signals_n"] = len(signals)
                 sig_path = Path("results") / "signals_output.csv"
                 signals.to_csv(sig_path)
                 log.info("Signals saved -> %s", sig_path)
                 log.info("\n%s", signals.head(10).to_string())
+            _tg["steps"]["signals"] = "ok"
         except Exception as exc:
             log.error("Signal scanner failed: %s", exc, exc_info=True)
+            _tg["steps"]["signals"] = "error"
             # Non-fatal - continue to charts and email
     else:
         log.info("Step 2/7 - Signals skipped (--no-signals).")
@@ -170,6 +197,7 @@ def main() -> None:
                 log.warning(
                     "Risk engine BLOCKED all orders: %s", risk_summary["block_reason"]
                 )
+                _tg["steps"]["risk"] = "warn"
             else:
                 log.info(
                     "Risk engine approved: %d/%d signal(s)  |  "
@@ -180,8 +208,10 @@ def main() -> None:
                     risk_summary["risk_multiplier"],
                     risk_summary["slots_available"],
                 )
+                _tg["steps"]["risk"] = "ok"
         except Exception as exc:
             log.error("Risk engine failed: %s", exc, exc_info=True)
+            _tg["steps"]["risk"] = "error"
             # Non-fatal — IBKR step will still run with whatever signals_final.csv contains
 
     # ── 4. Charts ─────────────────────────────────────────────────────────────
@@ -250,8 +280,11 @@ def main() -> None:
             try:
                 n = ibkr_run(sig_path, dry_run=dry)
                 log.info("IBKR: %d bracket order(s) submitted.", n)
+                _tg["orders_n"]       = n
+                _tg["steps"]["ibkr"] = "ok"
             except Exception as exc:
                 log.error("IBKR executor failed: %s", exc, exc_info=True)
+                _tg["steps"]["ibkr"] = "error"
                 # Non-fatal - pipeline still completes
 
     # ── 6. Exit logger (background) ───────────────────────────────────────────
@@ -301,10 +334,19 @@ def main() -> None:
 
                 proc = subprocess.Popen(**kwargs)
                 log.info("Exit logger launched  PID=%d  log -> %s", proc.pid, el_log.name)
+                _tg["steps"]["exit_logger"] = "ok"
 
         except Exception as exc:
             log.error("Failed to launch exit logger: %s", exc, exc_info=True)
+            _tg["steps"]["exit_logger"] = "error"
             # Non-fatal — pipeline still completes
+
+    # ── 8. Telegram summary ───────────────────────────────────────────────────
+    log.info("Step 8/8 - Sending Telegram daily summary ...")
+    try:
+        send_daily_summary(_tg)
+    except Exception as exc:
+        log.warning("Telegram summary failed (non-fatal): %s", exc)
 
     log.info("=" * 62)
     log.info("  Daily run complete.  Log -> %s", log_file)
