@@ -54,6 +54,7 @@ TIME_STOP_DAYS         = 10               # trading days before forced exit
 TIME_STOP_CHECK_MINS   = 30              # how often to poll for time-stop conditions
 
 TRADES_CSV             = Path("logs/trades.csv")
+PENDING_CSV            = Path("logs/pending_orders.csv")
 EQUITY_CSV             = Path("results/equity_curve.csv")
 PID_FILE               = Path("logs/exit_logger.pid")
 
@@ -107,6 +108,99 @@ def _read_trades() -> pd.DataFrame:
 
 def _write_trades(df: pd.DataFrame) -> None:
     df.to_csv(TRADES_CSV, index=False)
+
+
+# ---------------------------------------------------------------------------
+# Pending orders helpers
+# ---------------------------------------------------------------------------
+
+PENDING_COLS = [
+    "timestamp", "ticker", "shares", "entry", "stop_loss", "target",
+    "risk_per_share", "risk_aud", "order_ref",
+    "parent_id", "tp_id", "sl_id",
+    "trigger_count", "composite_score", "account", "paper",
+]
+
+
+def _read_pending() -> pd.DataFrame:
+    """Read pending_orders.csv; return empty DataFrame if missing."""
+    if not PENDING_CSV.exists():
+        return pd.DataFrame(columns=PENDING_COLS)
+    try:
+        return pd.read_csv(PENDING_CSV, parse_dates=["timestamp"])
+    except Exception:
+        return pd.DataFrame(columns=PENDING_COLS)
+
+
+def _write_pending(df: pd.DataFrame) -> None:
+    PENDING_CSV.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(PENDING_CSV, index=False)
+
+
+def _promote_to_trades(order_ref: str, actual_fill_price: float, actual_shares: int) -> None:
+    """
+    Move a record from pending_orders.csv to trades.csv on confirmed entry fill.
+
+    The actual_fill_price overwrites the limit-order entry price so that
+    all subsequent P&L calculations use the real fill price.
+    actual_shares handles the case where a partial fill differs from requested.
+    """
+    pending = _read_pending()
+
+    match = pending[pending["order_ref"] == order_ref]
+    if match.empty:
+        log.warning("_promote_to_trades: %s not found in pending_orders.csv", order_ref)
+        return
+
+    # Check idempotency — don't double-promote
+    existing = _read_trades()
+    if not existing.empty and order_ref in existing["order_ref"].values:
+        log.info(
+            "_promote_to_trades: %s already in trades.csv — skipping duplicate promote",
+            order_ref,
+        )
+        return
+
+    row = match.iloc[0].copy()
+
+    # Overwrite with actual fill data
+    original_limit = float(row["entry"])
+    row["entry"]  = round(actual_fill_price, 4)
+    row["shares"] = actual_shares
+
+    # Recalculate risk_per_share and risk_aud against actual fill price
+    stop = float(row["stop_loss"])
+    rps  = actual_fill_price - stop
+    if rps > 0:
+        row["risk_per_share"] = round(rps, 4)
+        row["risk_aud"]       = round(rps * actual_shares, 2)
+
+    log.info(
+        "ENTRY FILL  %-6s  limit=%.3f  fill=%.3f  qty=%d  risk_aud=$%.2f  → trades.csv",
+        str(row["ticker"]).replace(".AX", ""),
+        original_limit,
+        actual_fill_price,
+        actual_shares,
+        row["risk_aud"],
+    )
+
+    # Append to trades.csv
+    TRADES_CSV.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not TRADES_CSV.exists()
+    with open(TRADES_CSV, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=ALL_COLS)
+        if write_header:
+            writer.writeheader()
+        # Write entry columns only (no exit data yet)
+        out = {col: row.get(col, "") for col in PENDING_COLS}
+        for col in EXIT_COLS:
+            out[col] = ""
+        writer.writerow(out)
+
+    # Remove from pending_orders.csv
+    pending_remaining = pending[pending["order_ref"] != order_ref]
+    _write_pending(pending_remaining)
+    log.info("  Removed %s from pending_orders.csv", order_ref)
 
 
 def _canonical_open(df: pd.DataFrame) -> pd.DataFrame:
@@ -324,17 +418,55 @@ def _check_time_stops(ib, dry_run: bool = False) -> None:
 def _make_exec_handler(dry_run: bool):
     """Return an execDetailsEvent callback bound to dry_run flag."""
 
+    # Track cumulative fill quantities per order_ref so we can detect
+    # when an ASX multi-tranche entry fill is complete.
+    _entry_cum: dict[str, int] = {}
+
     def on_exec_details(trade, fill):
         """Fired whenever an execution (fill) arrives from TWS."""
-        ref       = fill.execution.orderRef   # e.g. "ASX-20260405-SMR-TP"
+        ref       = fill.execution.orderRef   # e.g. "ASX-20260405-SMR" or "-TP"/"-SL"
         action    = fill.execution.side       # "BOT" or "SLD"
         avg_price = float(fill.execution.avgPrice)
-        shares    = int(fill.execution.shares)
+        cum_qty   = int(fill.execution.cumQty)
+        fill_qty  = int(fill.execution.shares)
 
-        # Only care about our SELL exits (TP or SL leg)
-        if action != "SLD":
-            return
         if not ref.startswith("ASX-"):
+            return
+
+        # ── Entry fill (BOT, no suffix) ───────────────────────────────────────
+        if action == "BOT" and not any(ref.endswith(s) for s in ("-TP", "-SL", "-TS")):
+            base_ref = ref
+            _entry_cum[base_ref] = cum_qty   # track running cumQty
+
+            log.info(
+                "ENTRY FILL  ref=%-28s  cumQty=%d  avgPrice=%.3f",
+                ref, cum_qty, avg_price,
+            )
+
+            # Look up the requested quantity from pending_orders.csv
+            pending = _read_pending()
+            match   = pending[pending["order_ref"] == base_ref]
+            requested_qty = int(match.iloc[0]["shares"]) if not match.empty else 0
+
+            if requested_qty > 0 and cum_qty < requested_qty:
+                log.info(
+                    "  Partial fill %d / %d shares — waiting for remainder",
+                    cum_qty, requested_qty,
+                )
+                return  # wait for final tranche
+
+            # Final fill reached (cumQty >= requested, or no pending record found)
+            if dry_run:
+                log.info(
+                    "  [DRY-RUN] Would promote %s to trades.csv  fill=%.3f  qty=%d",
+                    base_ref, avg_price, cum_qty,
+                )
+            else:
+                _promote_to_trades(base_ref, avg_price, cum_qty)
+            return
+
+        # ── Exit fill (SLD) ───────────────────────────────────────────────────
+        if action != "SLD":
             return
 
         if ref.endswith("-TP"):
@@ -350,8 +482,8 @@ def _make_exec_handler(dry_run: bool):
             return   # not one of ours
 
         log.info(
-            "FILL detected  ref=%-30s  action=%-3s  price=%.3f  qty=%d",
-            ref, action, avg_price, shares,
+            "EXIT FILL  ref=%-30s  action=%-3s  price=%.3f  qty=%d",
+            ref, action, avg_price, fill_qty,
         )
         _record_exit(base_ref, avg_price, exit_type, dry_run=dry_run)
 
@@ -377,24 +509,43 @@ async def _time_stop_loop(ib, dry_run: bool) -> None:
 # ---------------------------------------------------------------------------
 
 def _print_open_summary() -> None:
-    """Log the current open positions we will be watching."""
+    """Log the current open positions and pending orders we will be watching."""
     df = _read_trades()
     open_rows = _canonical_open(df)
 
     if open_rows.empty:
         log.info("No open positions found in trades.csv.")
-        return
+    else:
+        log.info("Watching %d open position(s):", len(open_rows))
+        for _, r in open_rows.iterrows():
+            days = _trading_days_elapsed(pd.to_datetime(r["timestamp"]))
+            log.info(
+                "  %-6s  entry=%.3f  stop=%.3f  target=%.3f  "
+                "tp_id=%-4d  sl_id=%-4d  held=%dd",
+                str(r["ticker"]).replace(".AX",""),
+                r["entry"], r["stop_loss"], r["target"],
+                int(r["tp_id"]), int(r["sl_id"]), days,
+            )
 
-    log.info("Watching %d open position(s):", len(open_rows))
-    for _, r in open_rows.iterrows():
-        days = _trading_days_elapsed(pd.to_datetime(r["timestamp"]))
-        log.info(
-            "  %-6s  entry=%.3f  stop=%.3f  target=%.3f  "
-            "tp_id=%-4d  sl_id=%-4d  held=%dd",
-            str(r["ticker"]).replace(".AX",""),
-            r["entry"], r["stop_loss"], r["target"],
-            int(r["tp_id"]), int(r["sl_id"]), days,
-        )
+    # Also report pending orders (submitted, awaiting entry fill)
+    pending = _read_pending()
+    # Filter out any already promoted to trades
+    if not pending.empty and not df.empty:
+        filled_refs = set(df["order_ref"].dropna())
+        pending = pending[~pending["order_ref"].isin(filled_refs)]
+
+    if not pending.empty:
+        log.info("Pending orders (awaiting entry fill): %d", len(pending))
+        for _, r in pending.iterrows():
+            days = _trading_days_elapsed(pd.to_datetime(r["timestamp"]))
+            stale = " *** STALE ***" if days >= 3 else ""
+            log.info(
+                "  %-6s  limit=%.3f  stop=%.3f  target=%.3f  "
+                "waiting=%dd%s",
+                str(r["ticker"]).replace(".AX",""),
+                r["entry"], r["stop_loss"], r["target"],
+                days, stale,
+            )
 
 
 # ---------------------------------------------------------------------------

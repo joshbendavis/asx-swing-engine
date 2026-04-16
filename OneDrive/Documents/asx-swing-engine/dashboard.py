@@ -133,11 +133,14 @@ st.markdown("""
 # Constants
 # ---------------------------------------------------------------------------
 TRADES_CSV       = Path("logs/trades.csv")
+PENDING_CSV      = Path("logs/pending_orders.csv")
 EQUITY_CSV       = Path("results/equity_curve.csv")
 REGIME_JSON      = Path("results/regime.json")
 SIGNALS_CSV      = Path("results/signals_output.csv")
 COOLDOWN_JSON    = Path("results/kill_cooldown.json")
 SOFT_BREACH_JSON = Path("results/soft_breach.json")
+
+STALE_ORDER_DAYS = 3   # pending orders older than this are flagged
 
 REFRESH_SECS     = 300
 STARTING_BALANCE = 20_000.0
@@ -245,6 +248,49 @@ def _load_equity() -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=REFRESH_SECS)
+def _load_pending() -> pd.DataFrame:
+    """Load pending_orders.csv — submitted brackets not yet filled."""
+    if not PENDING_CSV.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(PENDING_CSV, parse_dates=["timestamp"])
+        if df.empty:
+            return df
+        # Exclude any order_refs already promoted to trades.csv
+        if TRADES_CSV.exists():
+            try:
+                trades = pd.read_csv(TRADES_CSV)
+                if not trades.empty:
+                    filled = set(trades["order_ref"].dropna())
+                    df = df[~df["order_ref"].isin(filled)]
+            except Exception:
+                pass
+        return df.drop_duplicates(subset="order_ref", keep="last").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _stale_pending(pending_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return rows from pending_df where the order has been waiting
+    >= STALE_ORDER_DAYS trading days without filling.
+    """
+    if pending_df.empty or "timestamp" not in pending_df.columns:
+        return pd.DataFrame()
+    today = date.today()
+    rows  = []
+    for _, row in pending_df.iterrows():
+        try:
+            sub_date = pd.to_datetime(row["timestamp"]).date()
+            bdays    = int(np.busday_count(sub_date.isoformat(), today.isoformat()))
+            if bdays >= STALE_ORDER_DAYS:
+                rows.append({**row.to_dict(), "_waiting_days": bdays})
+        except Exception:
+            pass
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 @st.cache_data(ttl=REFRESH_SECS)
@@ -1238,11 +1284,13 @@ def _drift_colour(drift: float) -> str:
 # --- Load all data ---
 regime      = _load_regime()
 trades_df   = _load_trades()
+pending_df  = _load_pending()
 equity_df   = _load_equity()
 signals_df  = _load_signals()
 bt_eq       = _load_backtest_equity()
 bt_trades   = _load_backtest_trades()
 last_run    = _parse_last_run()
+stale_df    = _stale_pending(pending_df)
 
 # --- Derived ---
 live_eq              = _build_live_equity(equity_df)
@@ -1455,8 +1503,13 @@ with ph_right:
         delta_colour=car_clr,
     )
 
+# ── Open Positions (confirmed entry fills) ───────────────────────────────
+st.markdown(
+    "**Open Positions** "
+    "<span style='color:#888;font-size:11px;'>entry filled · consuming heat budget</span>",
+    unsafe_allow_html=True,
+)
 if not open_df.empty:
-    st.markdown("**Open Positions**")
     cols_show = [c for c in ["timestamp","ticker","shares","entry","stop_loss","target","risk_aud"]
                  if c in open_df.columns]
     disp = open_df[cols_show].copy()
@@ -1466,7 +1519,68 @@ if not open_df.empty:
         disp["risk_aud"] = disp["risk_aud"].map(lambda x: f"${x:.0f}")
     st.dataframe(disp, use_container_width=True, hide_index=True)
 else:
-    st.info("No open positions.", icon="💤")
+    st.caption("No filled positions.")
+
+# ── Pending Orders (submitted, awaiting entry fill) ───────────────────────
+st.markdown(
+    "**Pending Orders** "
+    "<span style='color:#888;font-size:11px;'>submitted · awaiting limit fill · "
+    "not consuming heat budget</span>",
+    unsafe_allow_html=True,
+)
+if not stale_df.empty:
+    stale_refs = set(stale_df["order_ref"].dropna())
+    st.markdown(
+        f'<div style="background:#1a1200;border:1px solid {AMBER};border-radius:6px;'
+        f'padding:8px 14px;margin-bottom:8px;">'
+        f'<span style="color:{AMBER};font-weight:600;">⚠️ {len(stale_df)} STALE order'
+        f'{"s" if len(stale_df) != 1 else ""} — waiting ≥{STALE_ORDER_DAYS} trading days without filling</span>'
+        f'<div style="color:#aaa;font-size:11px;margin-top:3px;">'
+        f'Tickers: {", ".join(str(t).replace(".AX","") for t in stale_df["ticker"].values)} — '
+        f'consider cancelling in TWS if the setup has moved on</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+if not pending_df.empty:
+    today = date.today()
+    pend_disp = []
+    for _, row in pending_df.iterrows():
+        try:
+            sub_date  = pd.to_datetime(row["timestamp"]).date()
+            wait_days = int(np.busday_count(sub_date.isoformat(), today.isoformat()))
+        except Exception:
+            wait_days = 0
+        is_stale  = wait_days >= STALE_ORDER_DAYS
+        pend_disp.append({
+            "Submitted":  pd.to_datetime(row["timestamp"]).strftime("%Y-%m-%d"),
+            "Ticker":     str(row.get("ticker","—")),
+            "Shares":     int(row.get("shares", 0)),
+            "Limit":      f"{float(row['entry']):.3f}"    if "entry"     in row else "—",
+            "Stop":       f"{float(row['stop_loss']):.3f}" if "stop_loss" in row else "—",
+            "Target":     f"{float(row['target']):.3f}"   if "target"    in row else "—",
+            "Risk":       f"${float(row['risk_aud']):.0f}" if "risk_aud"  in row else "—",
+            "Waiting":    f"{wait_days}d",
+            "Status":     "⚠️ STALE" if is_stale else "⏳ working",
+        })
+    pend_show = pd.DataFrame(pend_disp)
+
+    def _style_pending(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        for i, row in df.iterrows():
+            if "STALE" in str(row["Status"]):
+                styles.loc[i, "Status"]  = f"color:{AMBER};font-weight:600"
+                styles.loc[i, "Waiting"] = f"color:{AMBER}"
+            else:
+                styles.loc[i, "Status"]  = f"color:{BLUE}"
+        return styles
+
+    st.dataframe(
+        pend_show.style.apply(_style_pending, axis=None),
+        use_container_width=True, hide_index=True,
+    )
+else:
+    st.caption("No pending orders.")
 
 # ===========================================================================
 # ROW 2 — EDGE VALIDATION

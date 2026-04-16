@@ -65,6 +65,7 @@ PAPER_BALANCE_OVERRIDE = os.getenv("PAPER_BALANCE_OVERRIDE", "").strip()
 
 SIGNALS_CSV      = Path("results/signals_final.csv")    # written by risk_engine.py
 TRADE_LOG        = Path("logs/trades.csv")
+PENDING_LOG      = Path("logs/pending_orders.csv")      # submitted but not yet filled
 
 CONNECT_TIMEOUT  = 10                   # seconds to wait for TWS connection
 ORDER_PAUSE      = 0.5                  # seconds between order submissions
@@ -92,7 +93,7 @@ logging.basicConfig(
 log = logging.getLogger("ibkr-executor")
 
 # ---------------------------------------------------------------------------
-# Trade log CSV
+# CSV schemas
 # ---------------------------------------------------------------------------
 TRADE_LOG_COLS = [
     "timestamp", "ticker", "shares", "entry", "stop_loss", "target",
@@ -101,22 +102,90 @@ TRADE_LOG_COLS = [
     "trigger_count", "composite_score", "account", "paper",
 ]
 
+# pending_orders.csv uses the same schema as trades.csv so the dashboard
+# can render both tables identically.
+PENDING_LOG_COLS = TRADE_LOG_COLS
+
+
+def _init_csv(path: Path, cols: list[str]) -> None:
+    """Create a CSV file with header row if it does not already exist."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            csv.DictWriter(fh, fieldnames=cols).writeheader()
+        log.info("Created %s", path)
+
 
 def _init_trade_log() -> None:
-    """Create logs/trades.csv with header row if it doesn't already exist."""
-    TRADE_LOG.parent.mkdir(parents=True, exist_ok=True)
-    if not TRADE_LOG.exists():
-        with open(TRADE_LOG, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=TRADE_LOG_COLS)
-            writer.writeheader()
-        log.info("Created trade log -> %s", TRADE_LOG)
+    _init_csv(TRADE_LOG, TRADE_LOG_COLS)
+
+
+def _init_pending_log() -> None:
+    _init_csv(PENDING_LOG, PENDING_LOG_COLS)
+
+
+def _append_to_csv(path: Path, cols: list[str], row: dict) -> None:
+    """Append one row to a CSV file."""
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        csv.DictWriter(fh, fieldnames=cols).writerow(
+            {col: row.get(col, "") for col in cols}
+        )
 
 
 def _append_trade_log(row: dict) -> None:
-    """Append one completed bracket submission to logs/trades.csv."""
-    with open(TRADE_LOG, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=TRADE_LOG_COLS)
-        writer.writerow({col: row.get(col, "") for col in TRADE_LOG_COLS})
+    """Append one confirmed-fill record to logs/trades.csv."""
+    _append_to_csv(TRADE_LOG, TRADE_LOG_COLS, row)
+
+
+def _append_pending_log(row: dict) -> None:
+    """Append one submitted-but-unfilled bracket to logs/pending_orders.csv."""
+    _append_to_csv(PENDING_LOG, PENDING_LOG_COLS, row)
+
+
+def _count_pending_orders() -> int:
+    """
+    Count pending orders whose order_ref has NOT yet appeared in trades.csv.
+    Used to calculate remaining position headroom before submitting new orders.
+    """
+    if not PENDING_LOG.exists():
+        return 0
+    try:
+        pending = pd.read_csv(PENDING_LOG)
+        if pending.empty:
+            return 0
+        if TRADE_LOG.exists():
+            trades = pd.read_csv(TRADE_LOG)
+            filled_refs = set(trades["order_ref"].dropna()) if not trades.empty else set()
+        else:
+            filled_refs = set()
+        unfilled = pending[~pending["order_ref"].isin(filled_refs)]
+        return len(unfilled.drop_duplicates(subset="order_ref"))
+    except Exception:
+        return 0
+
+
+def _already_in_pending(symbol: str) -> bool:
+    """
+    Return True if an open (unfilled) pending order for this symbol exists.
+    Prevents re-submission if executor runs twice on the same day.
+    """
+    if not PENDING_LOG.exists():
+        return False
+    try:
+        pending = pd.read_csv(PENDING_LOG)
+        if pending.empty:
+            return False
+        today_prefix = f"ASX-{datetime.today().strftime('%Y%m%d')}-{symbol}"
+        # Check if already promoted to trades
+        filled_refs: set[str] = set()
+        if TRADE_LOG.exists():
+            trades = pd.read_csv(TRADE_LOG)
+            if not trades.empty:
+                filled_refs = set(trades["order_ref"].dropna())
+        unresolved = pending[~pending["order_ref"].isin(filled_refs)]
+        return unresolved["order_ref"].str.startswith(today_prefix).any()
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -319,13 +388,23 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
     Returns the number of orders submitted (or would-be submitted in dry-run).
     """
     _init_trade_log()
+    _init_pending_log()
 
     # ── Load signals ─────────────────────────────────────────────────────────
     if not signals_path.exists():
         log.error("Signals file not found: %s", signals_path)
         return 0
 
-    signals = pd.read_csv(signals_path)
+    # Guard: file may exist but be empty (0 bytes) — pd.read_csv raises
+    # "No columns to parse from file" in that case; treat it as no signals.
+    if signals_path.stat().st_size == 0:
+        log.info("Signals file is empty — nothing to trade.")
+        return 0
+    try:
+        signals = pd.read_csv(signals_path)
+    except Exception as exc:
+        log.warning("Could not parse signals file (%s): %s — skipping.", signals_path, exc)
+        return 0
     if signals.empty:
         log.info("No signals in %s - nothing to trade.", signals_path)
         return 0
@@ -366,9 +445,22 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
                 balance, open_positions, MAX_POSITIONS,
             )
 
-    headroom = MAX_POSITIONS - open_positions
+    # Pending orders (submitted but not yet filled) also consume slots —
+    # they will become real positions once the entry limit triggers.
+    pending_count = _count_pending_orders()
+    effective_open = open_positions + pending_count
+    headroom = MAX_POSITIONS - effective_open
+
+    log.info(
+        "Position slots: %d filled + %d pending = %d effective / %d max  →  %d slot(s) free",
+        open_positions, pending_count, effective_open, MAX_POSITIONS, max(0, headroom),
+    )
+
     if headroom <= 0:
-        log.info("Portfolio is full (%d/%d positions). No new orders.", open_positions, MAX_POSITIONS)
+        log.info(
+            "No headroom (%d filled + %d pending = %d/%d). No new orders.",
+            open_positions, pending_count, effective_open, MAX_POSITIONS,
+        )
         if ib:
             ib.disconnect()
         return 0
@@ -411,8 +503,12 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
         order_ref = f"ASX-{today_str}-{symbol}"
 
         # ── Duplicate guard ───────────────────────────────────────────────────
+        # Check both TWS open trades AND pending_orders.csv to survive restarts.
         if not dry_run and _already_ordered_today(ib, symbol):
-            log.info("%-6s: order already submitted today - skipping.", symbol)
+            log.info("%-6s: order already in TWS today - skipping.", symbol)
+            continue
+        if _already_in_pending(symbol):
+            log.info("%-6s: unfilled pending order exists - skipping.", symbol)
             continue
 
         log.info(
@@ -439,8 +535,9 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
                 log.error("  Order FAILED for %s: %s", symbol, exc, exc_info=True)
                 continue
 
-        # ── Append to trade log ───────────────────────────────────────────────
-        _append_trade_log({
+        # ── Write to pending_orders.csv (not trades.csv) ─────────────────────
+        # exit_logger promotes this record to trades.csv on confirmed entry fill.
+        _append_pending_log({
             "timestamp":       datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "ticker":          ticker,
             "shares":          shares,
@@ -458,6 +555,10 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
             "account":         IBKR_ACCOUNT,
             "paper":           PAPER,
         })
+        log.info(
+            "  %-6s written to pending_orders.csv (awaiting entry fill)",
+            symbol,
+        )
 
         submitted += 1
 
