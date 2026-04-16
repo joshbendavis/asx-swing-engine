@@ -1,14 +1,18 @@
 """
-dashboard.py  --  ASX Swing Engine daily monitoring dashboard
--------------------------------------------------------------
+dashboard.py  --  ASX Swing Engine — Professional Monitoring Dashboard
+----------------------------------------------------------------------
 Run with:  streamlit run dashboard.py
 
-Sections
-  1. Today's signals        -- results/signals_output.csv
-  2. Open trades            -- logs/trades.csv  +  live prices via yfinance
-  3. Performance summary    -- derived from logs/trades.csv closed trades
-  4. Equity curve           -- account balance over time
-  5. Top screener stocks    -- results/screener_output.csv  top 10
+Layout
+  Row 1  — Portfolio Health          (equity curve, drawdown, exposure/heat)
+  Row 2  — Edge Validation           (rolling 30-trade metrics, slippage, fill rate)
+  Panel  — Missed Trades Tracker     (signals → eligible → executed → missed + hypothetical P&L)
+  Row 3  — System Diagnostics        (regime matrix, gap stops, trade lifecycle, losing streak)
+  Panel  — Heat Over Time            (daily portfolio heat % line chart)
+  Panel  — Trade Quality Buckets     (C-filter blocked vs F-filter allowed P&L comparison)
+  Panel  — Rolling Expectancy        (rolling 10/30/50 avg R chart)
+  Panel  — Backtest vs Live          (side-by-side table, amber >15% drift, red >30%)
+  Bottom — Full trade log
 
 Auto-refreshes every 5 minutes.
 """
@@ -16,21 +20,21 @@ Auto-refreshes every 5 minutes.
 import json
 import math
 import re
-from datetime import datetime, date
+import time
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
-import streamlit as st
-import yfinance as yf
+import pandas as pd
 import plotly.graph_objects as go
+import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Page config
+# Page config  (must be first Streamlit call)
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="ASX Swing Engine",
-    page_icon="K",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -40,11 +44,11 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-  /* ── global background ── */
+  /* global */
   .stApp { background-color: #0d0d0d; color: #e0e0e0; }
   section[data-testid="stSidebar"] { background-color: #111111; }
 
-  /* ── metric tiles ── */
+  /* metric tiles */
   [data-testid="stMetric"] {
       background: #161616;
       border: 1px solid #2a2a2a;
@@ -55,38 +59,72 @@ st.markdown("""
   [data-testid="stMetricValue"] { color: #e0e0e0 !important; font-size: 22px !important; }
   [data-testid="stMetricDelta"] { font-size: 13px !important; }
 
-  /* ── dataframe tables ── */
+  /* dataframe */
   [data-testid="stDataFrame"] { border: 1px solid #2a2a2a; border-radius: 6px; }
-  .stDataFrame thead th {
-      background-color: #1e1e1e !important;
-      color: #888 !important;
-      font-size: 11px !important;
-      font-weight: 600 !important;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-  }
 
-  /* ── section headers ── */
+  /* section headers */
   h2 { color: #f5a623 !important; font-size: 16px !important;
        border-bottom: 1px solid #2a2a2a; padding-bottom: 6px; margin-top: 28px !important; }
-  h3 { color: #e0e0e0 !important; font-size: 13px !important; }
+  h3 { color: #aaaaaa !important; font-size: 13px !important; }
 
-  /* ── pill badges ── */
-  .pill {
-      display: inline-block;
-      padding: 2px 8px;
+  /* pills */
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px;
+          font-size:11px; font-weight:600; }
+  .pill-green { background:#0d2b1e; color:#26a69a; border:1px solid #26a69a44; }
+  .pill-red   { background:#2b0d0d; color:#ef5350; border:#ef535044 1px solid; }
+  .pill-amber { background:#2b1e0d; color:#f5a623; border:#f5a62344 1px solid; }
+  .pill-blue  { background:#0d1a2b; color:#58a6ff; border:#58a6ff44 1px solid; }
+
+  /* data collection phase note */
+  .phase-note {
+      color: #888; font-size: 11px; font-style: italic;
+      border-left: 2px solid #333; padding-left: 8px; margin-top: 6px;
+  }
+
+  /* kill conditions banner */
+  .kill-banner {
+      background: #1a0505;
+      border: 2px solid #ef5350;
       border-radius: 10px;
-      font-size: 11px;
+      padding: 16px 22px;
+      margin-bottom: 16px;
+  }
+  .kill-banner-title {
+      color: #ef5350;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      margin-bottom: 10px;
+  }
+  .kill-item {
+      color: #ffcdd2;
+      font-size: 13px;
+      padding: 3px 0;
+      border-left: 3px solid #ef5350;
+      padding-left: 10px;
+      margin-bottom: 5px;
+  }
+  .kill-clear {
+      background: #051a0a;
+      border: 2px solid #26a69a;
+      border-radius: 10px;
+      padding: 12px 22px;
+      margin-bottom: 16px;
+      color: #26a69a;
+      font-size: 14px;
       font-weight: 600;
   }
-  .pill-green { background: #0d2b1e; color: #26a69a; border: 1px solid #26a69a44; }
-  .pill-red   { background: #2b0d0d; color: #ef5350; border: 1px solid #ef535044; }
-  .pill-amber { background: #2b1e0d; color: #f5a623; border: 1px solid #f5a62344; }
 
-  /* ── divider ── */
+  /* low-confidence overlay label */
+  .low-conf-note {
+      color: #f5a623; font-size: 11px; font-style: italic;
+      opacity: 0.8; margin-top: 2px;
+  }
+
+  /* divider */
   hr { border-color: #2a2a2a; }
 
-  /* ── hide streamlit chrome ── */
+  /* hide streamlit chrome */
   #MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -94,993 +132,1832 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SIGNALS_CSV   = Path("results/signals_output.csv")
-TRADES_CSV    = Path("logs/trades.csv")
-EQUITY_CSV    = Path("results/equity_curve.csv")
-SCREENER_CSV  = Path("results/screener_output.csv")
-REGIME_JSON   = Path("results/regime.json")
-REFRESH_SECS  = 300   # 5 minutes
+TRADES_CSV       = Path("logs/trades.csv")
+EQUITY_CSV       = Path("results/equity_curve.csv")
+REGIME_JSON      = Path("results/regime.json")
+SIGNALS_CSV      = Path("results/signals_output.csv")
+COOLDOWN_JSON    = Path("results/kill_cooldown.json")
+SOFT_BREACH_JSON = Path("results/soft_breach.json")
+
+REFRESH_SECS     = 300
 STARTING_BALANCE = 20_000.0
+MAX_POSITIONS    = 6
+HEAT_BUDGET      = 9.0          # %
+AVG_RISK_PER_TRADE = 300.0      # ~1.5% of $20k, used for hypothetical miss P&L
 
 GREEN = "#26a69a"
 RED   = "#ef5350"
 AMBER = "#f5a623"
 GREY  = "#888888"
+BLUE  = "#58a6ff"
+PURPLE = "#b39ddb"
+
+PLOT_LAYOUT = dict(
+    paper_bgcolor="#161616",
+    plot_bgcolor="#161616",
+    font=dict(color="#e0e0e0", size=11),
+    margin=dict(l=45, r=15, t=30, b=35),
+    xaxis=dict(gridcolor="#2a2a2a", linecolor="#2a2a2a", zeroline=False),
+    yaxis=dict(gridcolor="#2a2a2a", linecolor="#2a2a2a", zeroline=False),
+)
+
+# Backtest benchmark constants — Variant F 8-year validation (2017–2026, 102 trades)
+BT = {
+    "win_rate":        15.7,    # %
+    "avg_r":           0.293,
+    "profit_factor":   0.91,
+    "gap_stop_pct":    16.7,    # gap stops as % of all exits  (17/102)
+    "avg_hold_days":   14.8,
+    "max_consec_loss": 4,
+    "sharpe":          1.06,
+    "cagr":            4.5,
+    "max_dd":          9.0,     # % (positive number)
+    "expectancy":      89.0,    # AUD / trade
+    # Regime breakdown from 8-year backtest
+    "regime_trades":   {"STRONG_BULL": 55, "WEAK_BULL": 12, "CHOPPY_BEAR": 35},
+    "regime_win_rate": {"STRONG_BULL": 18.2, "WEAK_BULL": 16.7, "CHOPPY_BEAR": 11.4},
+    "regime_avg_r":    {"STRONG_BULL": 0.42, "WEAK_BULL": 0.31, "CHOPPY_BEAR": 0.09},
+}
+DRIFT_WARN      = 0.15   # amber at 15% drift
+DRIFT_THRESHOLD = 0.30   # red at 30% drift
+DATA_COLLECTION_TRADES = 30   # trades before stats are meaningful
+
+# Kill-condition thresholds
+KILL_EXPECTANCY_MIN         = 0.0    # rolling-30 avg R must be > 0
+KILL_PF_MIN                 = 0.7    # rolling-30 profit factor floor
+KILL_GAP_STOP_MAX           = BT["gap_stop_pct"] * 2   # ~33.4% — double backtest rate
+KILL_SLIPPAGE_MAX           = 0.40   # % — live entry slippage ceiling
+KILL_REGIME_INVERSION       = True   # flag: CHOPPY_BEAR avg R > STRONG_BULL avg R
+KILL_REGIME_MIN_TRADES      = 10     # minimum trades per regime before inversion can fire
+KILL_COOLDOWN_DAYS          = 5      # trading-day pause after any kill condition fires
+SOFT_BREACH_WARN_DAYS       = 3      # consecutive amber days before manual review warning
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Data loaders
 # ---------------------------------------------------------------------------
-
-def _colour(val: float, good_positive: bool = True) -> str:
-    if val > 0:
-        return GREEN if good_positive else RED
-    if val < 0:
-        return RED if good_positive else GREEN
-    return GREY
-
-
-def _fmt_pct(v: float) -> str:
-    return f"{v:+.1f}%" if not math.isnan(v) else "n/a"
-
-
-def _fmt_aud(v: float) -> str:
-    return f"${v:,.0f}" if not math.isnan(v) else "n/a"
-
 
 @st.cache_data(ttl=REFRESH_SECS)
 def _load_regime() -> dict:
-    """Load results/regime.json; return safe BULL defaults if missing."""
-    default = {"regime": "BULL", "position_size_multiplier": 1.0}
+    default = {
+        "regime": "BULL",
+        "f_regime": "STRONG_BULL",
+        "f_regime_size_multiplier": 1.0,
+        "position_size_multiplier": 1.0,
+    }
     if not REGIME_JSON.exists():
         return default
     try:
-        with open(REGIME_JSON, "r") as f:
-            return json.load(f)
+        with open(REGIME_JSON) as f:
+            data = json.load(f)
+        if "f_regime" not in data:
+            data["f_regime"] = "STRONG_BULL"
+        if "f_regime_size_multiplier" not in data:
+            data["f_regime_size_multiplier"] = 1.0
+        return data
     except Exception:
         return default
-
-
-@st.cache_data(ttl=REFRESH_SECS)
-def _fetch_prices(tickers: list[str]) -> dict[str, float]:
-    """Fetch latest close prices for a list of tickers."""
-    if not tickers:
-        return {}
-    prices = {}
-    try:
-        raw = yf.download(tickers, period="2d", interval="1d",
-                          auto_adjust=True, progress=False, threads=True)
-        close = raw["Close"]
-        if isinstance(close, pd.Series):
-            close = close.to_frame(name=tickers[0])
-        for t in tickers:
-            if t in close.columns:
-                last = close[t].dropna()
-                if not last.empty:
-                    prices[t] = float(last.iloc[-1])
-    except Exception:
-        pass
-    return prices
-
-
-@st.cache_data(ttl=REFRESH_SECS)
-def _load_signals() -> pd.DataFrame:
-    if not SIGNALS_CSV.exists():
-        return pd.DataFrame()
-    return pd.read_csv(SIGNALS_CSV)
 
 
 @st.cache_data(ttl=REFRESH_SECS)
 def _load_trades() -> pd.DataFrame:
+    """Entry records from logs/trades.csv — deduped on order_ref."""
     if not TRADES_CSV.exists():
         return pd.DataFrame()
-    df = pd.read_csv(TRADES_CSV, parse_dates=["timestamp"])
-    return df
+    try:
+        df = pd.read_csv(TRADES_CSV, parse_dates=["timestamp"])
+        if "order_ref" in df.columns:
+            df = df.drop_duplicates(subset="order_ref", keep="last")
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=REFRESH_SECS)
 def _load_equity() -> pd.DataFrame:
-    """Load live closed trades from results/equity_curve.csv."""
+    """Closed-trade P&L from results/equity_curve.csv."""
     if not EQUITY_CSV.exists():
         return pd.DataFrame()
-    df = pd.read_csv(EQUITY_CSV, parse_dates=["date"])
-    return df
+    try:
+        df = pd.read_csv(EQUITY_CSV, parse_dates=["date"])
+        df.sort_values("date", inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=REFRESH_SECS)
+def _load_signals() -> pd.DataFrame:
+    """Latest signal scan output from results/signals_output.csv."""
+    if not SIGNALS_CSV.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(SIGNALS_CSV)
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=REFRESH_SECS)
 def _load_backtest_equity() -> pd.Series:
-    """Load the most recent backtest equity curve as a normalised series."""
-    if not Path("results/backtest").exists():
+    """Variant F backtest equity curve (mark_to_market column)."""
+    bt_dir = Path("results/backtest")
+    if not bt_dir.exists():
         return pd.Series(dtype=float)
-    eq_files = sorted(Path("results/backtest").glob("equity_rs_top_20pct_*.csv"))
-    if not eq_files:
+    files = sorted(bt_dir.glob("equity_8y_f_*.csv"))
+    if not files:
         return pd.Series(dtype=float)
-    eq = pd.read_csv(eq_files[-1], index_col=0, parse_dates=True)
-    col = "mark_to_market" if "mark_to_market" in eq.columns else eq.columns[0]
-    return eq[col].dropna()
+    try:
+        eq = pd.read_csv(files[-1], index_col=0, parse_dates=True)
+        col = "mark_to_market" if "mark_to_market" in eq.columns else eq.columns[0]
+        return eq[col].dropna()
+    except Exception:
+        return pd.Series(dtype=float)
 
 
 @st.cache_data(ttl=REFRESH_SECS)
-def _load_screener() -> pd.DataFrame:
-    if not SCREENER_CSV.exists():
+def _load_backtest_trades() -> pd.DataFrame:
+    """Variant F backtest trades CSV."""
+    bt_dir = Path("results/backtest")
+    if not bt_dir.exists():
         return pd.DataFrame()
-    return pd.read_csv(SCREENER_CSV)
+    files = sorted(bt_dir.glob("trades_8y_f_regime_conditional_*.csv"))
+    if not files:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(files[-1], parse_dates=["entry_date", "exit_date"])
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=REFRESH_SECS)
 def _parse_last_run() -> dict:
-    """Parse the most recent run_*.log file and extract pipeline status.
-
-    Returns a dict with keys:
-        run_date        date | None
-        run_time        str "HH:MM" | None
-        steps           dict  step_name -> "ok"|"warn"|"error"|"skip"|None
-        screener_count  int | None
-        signals_count   int | None
-        orders_placed   int | None
-        orders_blocked  bool
-        complete        bool
-        log_file        str | None
-    """
     log_dir = Path("logs")
     if not log_dir.exists():
         return {}
     run_logs = sorted(log_dir.glob("run_*.log"), reverse=True)
     if not run_logs:
         return {}
-
     log_path = run_logs[0]
-
-    # Extract date/time from filename: run_YYYYMMDD_HHMMSS.log
-    fname_m = re.match(r"run_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})\d{2}\.log",
-                       log_path.name)
+    fname_m = re.match(r"run_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})\d{2}\.log", log_path.name)
     if not fname_m:
         return {}
     y, mo, d, h, mi = fname_m.groups()
     run_date = date(int(y), int(mo), int(d))
     run_time = f"{h}:{mi}"
-
     try:
         content = log_path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return {}
-
-    steps = {k: None for k in
-             ["regime", "screener", "signals", "risk", "charts", "email", "ibkr", "exit_logger"]}
-    screener_count: int | None = None
-    signals_count:  int | None = None
-    orders_placed:  int | None = None
-    orders_blocked: bool = False
-    complete:       bool = False
-
+    steps = {k: None for k in ["regime", "screener", "signals", "risk", "ibkr", "exit_logger"]}
+    screener_count = signals_count = signals_eligible = orders_placed = None
+    orders_blocked = complete = False
     for line in content.splitlines():
-
-        # ── Run start time (from log body — more precise than filename) ───────
-        if "ASX SWING ENGINE - daily run" in line:
-            ts = line.split("|")[0].strip()
-            if re.match(r"\d{2}:\d{2}:\d{2}", ts):
-                run_time = ts[:5]
-
-        # ── Step 0: Regime ────────────────────────────────────────────────────
         if re.search(r"Step \d+/\d+ - Detecting market regime", line):
             steps["regime"] = "ok"
         if "Regime written" in line:
             steps["regime"] = "ok"
-
-        # ── Step 1: Screener ──────────────────────────────────────────────────
         if re.search(r"Step \d+/\d+ - Running screener", line):
             steps["screener"] = "ok"
-        if re.search(r"Step \d+/\d+.*(Screener skipped|--no-screener)", line):
-            steps["screener"] = "skip"
-        m2 = re.search(r"Screener complete: (\d+) stocks passed", line)
-        if m2:
-            screener_count = int(m2.group(1))
-
-        # ── Step 2: Signals ───────────────────────────────────────────────────
+        m = re.search(r"Screener complete: (\d+) stocks passed", line)
+        if m:
+            screener_count = int(m.group(1))
         if re.search(r"Step \d+/\d+ - Running signal scanner", line):
             steps["signals"] = "ok"
-        if re.search(r"Step \d+/\d+ - Signals skipped", line):
-            steps["signals"] = "skip"
         if "Signal scanner failed" in line:
             steps["signals"] = "error"
-        m2 = re.search(r"(\d+) signal\(s\) found", line)
-        if m2:
-            signals_count = int(m2.group(1))
+        m = re.search(r"(\d+) signal\(s\) found", line)
+        if m:
+            signals_count = int(m.group(1))
+        # Eligible after regime/momentum filter
+        m = re.search(r"(\d+) signal\(s\) after (?:regime|momentum) filter", line)
+        if m:
+            signals_eligible = int(m.group(1))
         if "No entry signals today" in line and signals_count is None:
             signals_count = 0
-
-        # ── Step 3: Risk engine ───────────────────────────────────────────────
         if re.search(r"Step \d+/\d+ - Running risk engine", line):
             steps["risk"] = "ok"
-        if re.search(r"Step \d+/\d+ - Risk engine skipped", line):
-            steps["risk"] = "skip"
-        if "Risk engine failed" in line:
-            steps["risk"] = "error"
         if "Risk engine BLOCKED all orders" in line:
             steps["risk"] = "warn"
-            orders_blocked = True
-        m2 = re.search(r"Risk engine approved: (\d+)/\d+ signal", line)
-        if m2:
-            orders_placed = int(m2.group(1))
-
-        # ── Step 4: Charts ────────────────────────────────────────────────────
-        if re.search(r"Step \d+/\d+ - Generating charts", line):
-            steps["charts"] = "ok"
-        if re.search(r"Step \d+/\d+ - Charts skipped", line):
-            steps["charts"] = "skip"
-        if "Chart generation failed" in line:
-            steps["charts"] = "error"
-
-        # ── Step 5: Email ─────────────────────────────────────────────────────
-        if re.search(r"Step \d+/\d+ - Sending email", line):
-            steps["email"] = "ok"
-        if re.search(r"Step \d+/\d+ - Email skipped", line):
-            steps["email"] = "skip"
-        if "EMAIL_FROM or EMAIL_PASSWORD not set" in line:
-            steps["email"] = "skip"   # not configured — expected, not an error
-        if "Email sent successfully" in line:
-            steps["email"] = "ok"
-        if "Email failed" in line:
-            steps["email"] = "error"
-
-        # ── Step 6: IBKR ──────────────────────────────────────────────────────
-        if re.search(r"Step \d+/\d+ - IBKR order submission", line):
-            steps["ibkr"] = "ok"
-        if re.search(r"Step \d+/\d+ - IBKR skipped", line):
-            steps["ibkr"] = "skip"
-        if re.search(r"Step \d+/\d+ - no signals file found, skipping IBKR", line):
-            steps["ibkr"] = "skip"
-        m2 = re.search(r"IBKR: (\d+) bracket order\(s\) submitted", line)
-        if m2:
-            orders_placed = int(m2.group(1))
-            steps["ibkr"] = "ok"
-        if "IBKR executor failed" in line:
-            # "No columns to parse from file" = signals_final.csv empty (portfolio full / no trades)
-            # That's expected behaviour — show as warning, not hard error
-            if "No columns to parse" in line:
-                steps["ibkr"] = "warn"
-            else:
-                steps["ibkr"] = "error"   # real connection / API failure
-
-        # ── Step 7: Exit logger ───────────────────────────────────────────────
-        if re.search(r"Step \d+/\d+ - Starting exit logger", line):
-            steps["exit_logger"] = "ok"
-        if "Exit logger already running" in line:
-            steps["exit_logger"] = "ok"
-        if re.search(r"Step \d+/\d+ - Exit logger skipped", line):
-            steps["exit_logger"] = "skip"
-
-        # ── Completion marker ─────────────────────────────────────────────────
-        if "Daily run complete" in line:
+        m = re.search(r"Orders placed[: ]+(\d+)", line)
+        if m:
+            orders_placed = int(m.group(1))
+        if "Pipeline complete" in line or "Daily run complete" in line:
             complete = True
+    return dict(
+        run_date=run_date, run_time=run_time, steps=steps,
+        screener_count=screener_count,
+        signals_count=signals_count,
+        signals_eligible=signals_eligible,
+        orders_placed=orders_placed,
+        orders_blocked=orders_blocked,
+        complete=complete, log_file=log_path.name,
+    )
 
+
+# ---------------------------------------------------------------------------
+# Derived data helpers
+# ---------------------------------------------------------------------------
+
+def _build_live_equity(equity_df: pd.DataFrame) -> pd.Series:
+    """Convert equity_curve exits into a running account balance series."""
+    if equity_df.empty or "pnl_aud" not in equity_df.columns:
+        return pd.Series(dtype=float)
+    return equity_df.set_index("date")["pnl_aud"].cumsum() + STARTING_BALANCE
+
+
+def _compute_drawdown(equity: pd.Series) -> pd.Series:
+    if equity.empty:
+        return pd.Series(dtype=float)
+    peak = equity.cummax()
+    return (equity - peak) / peak * 100
+
+
+def _split_trades(trades_df: pd.DataFrame, equity_df: pd.DataFrame):
+    """Return (open_df, closed_df) by matching order_ref."""
+    if trades_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if equity_df.empty or "order_ref" not in equity_df.columns:
+        return trades_df.copy(), pd.DataFrame()
+    closed_refs = set(equity_df["order_ref"].dropna())
+    is_closed   = trades_df["order_ref"].isin(closed_refs)
+    return trades_df[~is_closed].copy(), trades_df[is_closed].copy()
+
+
+def _enrich_closed(closed_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.DataFrame:
+    """Join entry records with exit records to build full trade log."""
+    if closed_df.empty or equity_df.empty:
+        return pd.DataFrame()
+    exits = equity_df[["order_ref", "date", "exit_type", "pnl_aud"]].copy()
+    exits.rename(columns={"date": "exit_date"}, inplace=True)
+    merged = closed_df.merge(exits, on="order_ref", how="inner")
+    if "risk_aud" in merged.columns:
+        merged["pnl_r"] = (merged["pnl_aud"] / merged["risk_aud"]).round(2)
+    else:
+        merged["pnl_r"] = np.nan
+    return merged
+
+
+def _rolling_metrics(merged: pd.DataFrame, n: int = 30) -> dict:
+    result = dict(win_rate=np.nan, profit_factor=np.nan, expectancy=np.nan, avg_r=np.nan, n=0)
+    if merged.empty or "pnl_r" not in merged.columns:
+        return result
+    recent = merged.tail(n).copy()
+    result["n"] = len(recent)
+    if len(recent) == 0:
+        return result
+    wins   = recent[recent["pnl_r"] > 0]["pnl_r"]
+    losses = recent[recent["pnl_r"] <= 0]["pnl_r"]
+    result["win_rate"]  = round(len(wins) / len(recent) * 100, 1)
+    result["avg_r"]     = round(float(recent["pnl_r"].mean()), 3)
+    if "pnl_aud" in recent.columns:
+        result["expectancy"] = round(float(recent["pnl_aud"].mean()), 1)
+    gross_profit = wins.sum()
+    gross_loss   = abs(losses.sum())
+    result["profit_factor"] = round(gross_profit / gross_loss, 2) if gross_loss > 0 else np.nan
+    return result
+
+
+def _losing_streak(merged: pd.DataFrame) -> tuple[int, int]:
+    if merged.empty or "pnl_r" not in merged.columns:
+        return 0, 0
+    sort_col = "exit_date" if "exit_date" in merged.columns else merged.columns[0]
+    results  = (merged.sort_values(sort_col)["pnl_r"] > 0).tolist()
+    max_streak = cur_streak = 0
+    for win in results:
+        if not win:
+            cur_streak += 1
+            max_streak = max(max_streak, cur_streak)
+        else:
+            cur_streak = 0
+    cur = 0
+    for win in reversed(results):
+        if not win:
+            cur += 1
+        else:
+            break
+    return cur, max_streak
+
+
+def _exit_type_breakdown(merged: pd.DataFrame) -> dict:
+    if merged.empty or "exit_type" not in merged.columns:
+        return {}
+    return merged["exit_type"].value_counts().to_dict()
+
+
+def _gap_stop_stats(merged: pd.DataFrame) -> dict:
+    result = dict(count=0, pct=0.0, avg_gap_loss_r=np.nan,
+                  entry_slip_pct=np.nan, exit_slip_r=np.nan, gap_excess_r=np.nan)
+    if merged.empty or "exit_type" not in merged.columns:
+        return result
+    gap     = merged[merged["exit_type"].str.upper().str.contains("GAP", na=False)]
+    non_gap = merged[~merged["exit_type"].str.upper().str.contains("GAP", na=False)]
+    result["count"] = len(gap)
+    result["pct"]   = round(len(gap) / len(merged) * 100, 1) if len(merged) else 0.0
+    if not gap.empty and "pnl_r" in merged.columns:
+        result["avg_gap_loss_r"] = round(float(gap["pnl_r"].mean()), 2)
+        # Gap excess loss beyond normal -1R stop
+        result["gap_excess_r"] = round(float((gap["pnl_r"] - (-1.0)).mean()), 2)
+    # Exit slippage for normal stops: deviation of actual R from expected -1R
+    if "exit_type" in merged.columns and "pnl_r" in merged.columns:
+        normal_stops = merged[
+            merged["exit_type"].str.upper().str.contains("STOP", na=False) &
+            ~merged["exit_type"].str.upper().str.contains("GAP", na=False)
+        ]
+        if not normal_stops.empty:
+            result["exit_slip_r"] = round(float((normal_stops["pnl_r"] - (-1.0)).mean()), 3)
+    return result
+
+
+def _regime_performance_matrix(merged: pd.DataFrame) -> pd.DataFrame:
+    """Full regime breakdown: trades, win rate, avg R, total P&L — validates Variant F thesis."""
+    col = None
+    for c in ["f_regime", "regime", "regime_at_entry"]:
+        if c in merged.columns:
+            col = c
+            break
+    if col is None or merged.empty:
+        return pd.DataFrame()
+    rows = []
+    for regime in ["STRONG_BULL", "WEAK_BULL", "CHOPPY_BEAR"]:
+        grp = merged[merged[col] == regime]
+        if grp.empty:
+            rows.append({
+                "Regime": regime, "Trades": 0,
+                "Win %": "—", "Avg R": "—", "Total P&L": "—",
+                "BT Win %": f"{BT['regime_win_rate'].get(regime, '—'):.1f}%",
+                "BT Avg R": f"{BT['regime_avg_r'].get(regime, '—'):.2f}",
+            })
+            continue
+        wins     = (grp["pnl_r"] > 0).sum() if "pnl_r" in grp.columns else 0
+        total    = len(grp)
+        win_rate = round(wins / total * 100, 1) if total else 0.0
+        avg_r    = round(float(grp["pnl_r"].mean()), 3) if "pnl_r" in grp.columns else np.nan
+        pnl_aud  = round(float(grp["pnl_aud"].sum()), 0) if "pnl_aud" in grp.columns else np.nan
+        rows.append({
+            "Regime":    regime,
+            "Trades":    total,
+            "Win %":     f"{win_rate:.1f}%",
+            "Avg R":     f"{avg_r:.3f}" if not math.isnan(avg_r) else "—",
+            "Total P&L": f"${pnl_aud:+,.0f}" if not math.isnan(pnl_aud) else "—",
+            "BT Win %":  f"{BT['regime_win_rate'].get(regime, 0):.1f}%",
+            "BT Avg R":  f"{BT['regime_avg_r'].get(regime, 0):.2f}",
+        })
+    return pd.DataFrame(rows)
+
+
+def _missed_trades_tracker(last_run: dict, signals_df: pd.DataFrame,
+                            trades_df: pd.DataFrame) -> dict:
+    """
+    Funnel: signals generated → eligible after filters → executed → missed.
+    Missed hypothetical P&L uses backtest avg R × avg risk per trade.
+    """
+    out = dict(
+        generated=0, eligible=0, executed=0, missed=0,
+        hypo_pnl=0.0, hypo_r=0.0,
+    )
+    # signals generated (raw RS + trigger scan before regime filter)
+    out["generated"] = last_run.get("signals_count") or 0
+
+    # eligible = signals that passed regime/momentum filter
+    # signals_eligible is parsed from log; fallback to len(signals_df)
+    eligible = last_run.get("signals_eligible")
+    if eligible is None:
+        eligible = len(signals_df) if not signals_df.empty else out["generated"]
+    out["eligible"] = eligible
+
+    # executed = orders placed today
+    out["executed"] = last_run.get("orders_placed") or 0
+
+    # missed = eligible but not placed (heat/sector cap/position limit)
+    out["missed"] = max(0, out["eligible"] - out["executed"])
+
+    # hypothetical missed P&L
+    avg_risk = float(trades_df["risk_aud"].mean()) if (
+        not trades_df.empty and "risk_aud" in trades_df.columns) else AVG_RISK_PER_TRADE
+    out["hypo_r"]   = round(out["missed"] * BT["avg_r"], 2)
+    out["hypo_pnl"] = round(out["missed"] * BT["avg_r"] * avg_risk, 0)
+    return out
+
+
+def _heat_over_time_series(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> pd.Series:
+    """
+    Reconstruct daily portfolio heat % from open risk for each trading day.
+    For each calendar day, sum risk_aud of all trades open on that day,
+    divide by STARTING_BALANCE × 100.
+    """
+    if trades_df.empty or "timestamp" not in trades_df.columns:
+        return pd.Series(dtype=float)
+    if "risk_aud" not in trades_df.columns:
+        return pd.Series(dtype=float)
+
+    entries = trades_df[["timestamp", "order_ref", "risk_aud"]].copy()
+    entries["entry_date"] = pd.to_datetime(entries["timestamp"]).dt.date
+
+    # Get exit dates from equity_df
+    if not equity_df.empty and "order_ref" in equity_df.columns and "date" in equity_df.columns:
+        exit_map = equity_df.set_index("order_ref")["date"].to_dict()
+    else:
+        exit_map = {}
+
+    entries["exit_date"] = entries["order_ref"].map(exit_map)
+    entries["exit_date"] = pd.to_datetime(entries["exit_date"]).dt.date
+
+    if entries["entry_date"].empty:
+        return pd.Series(dtype=float)
+
+    first_day = entries["entry_date"].min()
+    last_day  = date.today()
+    all_days  = pd.date_range(first_day, last_day, freq="B")  # business days
+
+    heat_vals = []
+    for day in all_days:
+        d = day.date()
+        open_risk = entries[
+            (entries["entry_date"] <= d) &
+            (entries["exit_date"].isna() | (entries["exit_date"] >= d))
+        ]["risk_aud"].sum()
+        heat_vals.append(open_risk / STARTING_BALANCE * 100)
+
+    return pd.Series(heat_vals, index=all_days)
+
+
+def _trade_quality_buckets(merged: pd.DataFrame, signals_df: pd.DataFrame) -> dict:
+    """
+    Classify closed trades into quality buckets:
+      - F-only pass: STRONG_BULL / WEAK_BULL (always allowed by both C and F)
+      - F-pass, C-block: CHOPPY_BEAR where roc_20 > 0 AND ema50_slope > 0
+                         (F allowed via momentum gate; C would have blocked all CHOPPY_BEAR)
+      - Both block (shouldn't exist in live data)
+
+    If roc_20 / ema50_slope columns not available, infer from f_regime only.
+    """
+    if merged.empty:
+        return {}
+
+    regime_col = None
+    for c in ["f_regime", "regime"]:
+        if c in merged.columns:
+            regime_col = c
+            break
+
+    has_momentum = "roc_20" in merged.columns and "ema50_slope" in merged.columns
+
+    def bucket(row):
+        regime = row.get(regime_col, "") if regime_col else ""
+        if regime in ("STRONG_BULL", "WEAK_BULL"):
+            return "F-pass / C-pass"
+        if regime == "CHOPPY_BEAR":
+            if has_momentum:
+                roc  = row.get("roc_20", 0)
+                slp  = row.get("ema50_slope", 0)
+                if roc > 0 and slp > 0:
+                    return "F-pass / C-block"
+                else:
+                    return "Both block"
+            return "F-pass / C-block"   # CHOPPY_BEAR that passed momentum gate
+        return "Unknown"
+
+    if regime_col:
+        merged = merged.copy()
+        merged["bucket"] = merged.apply(bucket, axis=1)
+    else:
+        return {}
+
+    result = {}
+    for bkt, grp in merged.groupby("bucket"):
+        wins    = (grp["pnl_r"] > 0).sum() if "pnl_r" in grp.columns else 0
+        total   = len(grp)
+        avg_r   = round(float(grp["pnl_r"].mean()), 3) if ("pnl_r" in grp.columns and total) else np.nan
+        pnl_aud = round(float(grp["pnl_aud"].sum()), 0) if ("pnl_aud" in grp.columns and total) else np.nan
+        result[bkt] = {
+            "trades":   total,
+            "win_rate": round(wins / total * 100, 1) if total else 0.0,
+            "avg_r":    avg_r,
+            "pnl_aud":  pnl_aud,
+        }
+    return result
+
+
+def _rolling_expectancy_series(merged: pd.DataFrame) -> dict[int, pd.Series]:
+    """Return dict of {window: rolling mean pnl_r} for windows 10, 30, 50."""
+    out: dict[int, pd.Series] = {}
+    if merged.empty or "pnl_r" not in merged.columns:
+        return out
+    sort_col = "exit_date" if "exit_date" in merged.columns else merged.columns[0]
+    s = merged.sort_values(sort_col)["pnl_r"].reset_index(drop=True)
+    for w in [10, 30, 50]:
+        if len(s) >= w:
+            out[w] = s.rolling(w).mean()
+    return out
+
+
+def _slippage_decomposition(merged: pd.DataFrame, has_paper: bool) -> dict:
+    """
+    Decompose slippage/cost sources:
+      entry_slip_pct  — 0% for paper, N/A for live (no signal_price stored)
+      exit_slip_r     — deviation of normal-stop exits from expected -1R
+      gap_excess_r    — gap stop average loss beyond normal -1R
+      target_slip_r   — deviation of target exits from expected +2R
+    """
+    out = dict(
+        entry_slip_pct = 0.0 if has_paper else None,
+        exit_slip_r    = None,
+        gap_excess_r   = None,
+        target_slip_r  = None,
+    )
+    if merged.empty or "pnl_r" not in merged.columns or "exit_type" not in merged.columns:
+        return out
+
+    def _r_dev(grp, expected):
+        if grp.empty:
+            return None
+        return round(float((grp["pnl_r"] - expected).mean()), 3)
+
+    normal_stops = merged[
+        merged["exit_type"].str.upper().str.contains("STOP", na=False) &
+        ~merged["exit_type"].str.upper().str.contains("GAP", na=False)
+    ]
+    gap_stops = merged[merged["exit_type"].str.upper().str.contains("GAP", na=False)]
+    targets   = merged[merged["exit_type"].str.upper().str.contains("TARGET|TP", na=False)]
+
+    out["exit_slip_r"]  = _r_dev(normal_stops, -1.0)
+    out["gap_excess_r"] = _r_dev(gap_stops,    -1.0)
+    out["target_slip_r"]= _r_dev(targets,      +2.0)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kill conditions
+# ---------------------------------------------------------------------------
+
+def _check_kill_conditions(
+    roll30: dict,
+    gs: dict,
+    slip_decomp: dict,
+    regime_matrix: pd.DataFrame,
+    n_closed: int,
+) -> list[str]:
+    """
+    Return a list of human-readable kill condition strings that are triggered.
+    Empty list = all clear.  Conditions are only evaluated after 30 trades.
+    """
+    if n_closed < DATA_COLLECTION_TRADES:
+        return []   # still in data-collection phase
+
+    triggered = []
+
+    # 1. Rolling-30 expectancy turned negative
+    ar = roll30.get("avg_r")
+    if ar is not None and not math.isnan(ar) and ar < KILL_EXPECTANCY_MIN:
+        triggered.append(
+            f"Rolling-30 expectancy negative: {ar:.3f}R  "
+            f"(threshold ≥ {KILL_EXPECTANCY_MIN}R)"
+        )
+
+    # 2. Profit factor below floor
+    pf = roll30.get("profit_factor")
+    if pf is not None and not math.isnan(pf) and pf < KILL_PF_MIN:
+        triggered.append(
+            f"Rolling-30 profit factor: {pf:.2f}  "
+            f"(threshold ≥ {KILL_PF_MIN})"
+        )
+
+    # 3. Gap stop rate doubled vs backtest
+    gap_pct = gs.get("pct", 0.0)
+    if gap_pct > KILL_GAP_STOP_MAX:
+        triggered.append(
+            f"Gap stop rate {gap_pct:.1f}% exceeds 2× backtest baseline "
+            f"({KILL_GAP_STOP_MAX:.1f}%) — review gap-risk model"
+        )
+
+    # 4. Live entry slippage > 0.40% (only meaningful for non-paper)
+    entry_slip = slip_decomp.get("entry_slip_pct")
+    if entry_slip is not None and not math.isnan(entry_slip) and entry_slip > KILL_SLIPPAGE_MAX:
+        triggered.append(
+            f"Entry slippage {entry_slip:.2f}% consistently exceeds "
+            f"{KILL_SLIPPAGE_MAX:.2f}% ceiling — execution quality degraded"
+        )
+
+    # 5. CHOPPY_BEAR regime outperforming STRONG_BULL (regime inversion)
+    #    Requires minimum KILL_REGIME_MIN_TRADES trades in each regime before firing.
+    if not regime_matrix.empty and "Avg R" in regime_matrix.columns and KILL_REGIME_INVERSION:
+        r_map = {}
+        t_map = {}   # trade counts per regime
+        for _, row in regime_matrix.iterrows():
+            regime_name = row["Regime"]
+            val = row.get("Avg R", "—")
+            try:
+                r_map[regime_name] = float(str(val).replace("—", "nan"))
+            except (ValueError, TypeError):
+                r_map[regime_name] = float("nan")
+            try:
+                t_map[regime_name] = int(row.get("Trades", 0))
+            except (ValueError, TypeError):
+                t_map[regime_name] = 0
+
+        cb_r = r_map.get("CHOPPY_BEAR", float("nan"))
+        sb_r = r_map.get("STRONG_BULL", float("nan"))
+        cb_n = t_map.get("CHOPPY_BEAR", 0)
+        sb_n = t_map.get("STRONG_BULL", 0)
+
+        if (not math.isnan(cb_r) and not math.isnan(sb_r) and cb_r > sb_r):
+            if cb_n < KILL_REGIME_MIN_TRADES or sb_n < KILL_REGIME_MIN_TRADES:
+                # Not enough data — note it as a watch item, not a kill trigger
+                triggered.append(
+                    f"REGIME INVERSION WATCH: CHOPPY_BEAR avg R ({cb_r:.3f}) > "
+                    f"STRONG_BULL avg R ({sb_r:.3f}) — "
+                    f"insufficient data to confirm (CB:{cb_n} SB:{sb_n} trades, "
+                    f"need {KILL_REGIME_MIN_TRADES} each)"
+                )
+            else:
+                triggered.append(
+                    f"REGIME INVERSION: CHOPPY_BEAR avg R ({cb_r:.3f}) > "
+                    f"STRONG_BULL avg R ({sb_r:.3f}) — Variant F thesis breaking down "
+                    f"(CB:{cb_n} SB:{sb_n} trades — statistically significant)"
+                )
+
+    return triggered
+
+
+# ---------------------------------------------------------------------------
+# Capital at risk / latency / missed breakdown
+# ---------------------------------------------------------------------------
+
+def _capital_at_risk(open_df: pd.DataFrame, current_bal: float) -> dict:
+    """
+    Worst-case overnight loss if every open stop is hit simultaneously.
+    Returns: max_loss_aud, max_loss_pct, per_trade details.
+    """
+    if open_df.empty or "risk_aud" not in open_df.columns:
+        return {"max_loss_aud": 0.0, "max_loss_pct": 0.0, "positions": []}
+    total_risk = float(open_df["risk_aud"].sum())
+    positions  = []
+    for _, row in open_df.iterrows():
+        positions.append({
+            "ticker":    row.get("ticker", "—"),
+            "risk_aud":  float(row.get("risk_aud", 0)),
+            "stop_loss": float(row.get("stop_loss", 0)) if "stop_loss" in row else None,
+            "entry":     float(row.get("entry", 0))     if "entry"     in row else None,
+        })
     return {
-        "run_date":       run_date,
-        "run_time":       run_time,
-        "steps":          steps,
-        "screener_count": screener_count,
-        "signals_count":  signals_count,
-        "orders_placed":  orders_placed,
-        "orders_blocked": orders_blocked,
-        "complete":       complete,
-        "log_file":       log_path.name,
+        "max_loss_aud": round(total_risk, 0),
+        "max_loss_pct": round(total_risk / current_bal * 100, 2) if current_bal > 0 else 0.0,
+        "positions":    positions,
     }
 
 
-# ---------------------------------------------------------------------------
-# Last Run status bar  (very first content block)
-# ---------------------------------------------------------------------------
-_STEP_LABELS = {
-    "regime":       "Regime",
-    "screener":     "Screener",
-    "signals":      "Signals",
-    "risk":         "Risk",
-    "charts":       "Charts",
-    "email":        "Email",
-    "ibkr":         "IBKR",
-    "exit_logger":  "Exit Logger",
-}
-_STEP_STYLE = {
-    # status  -> (bg,      text,    border)
-    "ok":    ("#0d2b1e", "#26a69a", "#26a69a55"),
-    "warn":  ("#2b1e0d", "#f5a623", "#f5a62355"),
-    "error": ("#2b0d0d", "#ef5350", "#ef535055"),
-    "skip":  ("#1a1a1a", "#555555", "#33333355"),
-    None:    ("#1a1a1a", "#444444", "#33333333"),
-}
-_STATUS_ICON = {"ok": "✓", "warn": "!", "error": "✗", "skip": "—", None: "·"}
+def _parse_execution_latency(last_run: dict) -> float | None:
+    """
+    Read the most recent run log and return seconds between signal scan completion
+    and first order placement.  Returns None if unparseable.
+    """
+    log_file = last_run.get("log_file")
+    if not log_file:
+        return None
+    log_path = Path("logs") / log_file
+    if not log_path.exists():
+        return None
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+
+    signal_ts  = None
+    order_ts   = None
+
+    for line in content.splitlines():
+        # Match HH:MM:SS at start of line (common logging format)
+        ts_m = re.match(r"(\d{2}):(\d{2}):(\d{2})", line.strip())
+        if not ts_m:
+            continue
+        h, mi, s = int(ts_m.group(1)), int(ts_m.group(2)), int(ts_m.group(3))
+        secs = h * 3600 + mi * 60 + s
+
+        if signal_ts is None and re.search(
+            r"signal\(s\) found|signal scan complete|Signal scanner complete", line, re.I
+        ):
+            signal_ts = secs
+
+        if order_ts is None and re.search(
+            r"order(?:s)? placed|placing order|submitted order", line, re.I
+        ):
+            order_ts = secs
+
+    if signal_ts is not None and order_ts is not None and order_ts >= signal_ts:
+        return float(order_ts - signal_ts)
+    return None
 
 
-def _step_pill(name: str, status, detail: str = "") -> str:
-    bg, fg, border = _STEP_STYLE.get(status, _STEP_STYLE[None])
-    icon  = _STATUS_ICON.get(status, "·")
-    label = _STEP_LABELS.get(name, name)
-    body  = f"{icon} {label}"
-    if detail:
-        body += f" <span style='opacity:0.7;font-weight:400'>{detail}</span>"
-    return (
-        f"<span style='background:{bg};color:{fg};border:1px solid {border};"
-        f"border-radius:5px;padding:2px 9px;font-size:11px;font-weight:600;"
-        f"white-space:nowrap'>{body}</span>"
+def _parse_missed_breakdown(last_run: dict) -> dict:
+    """
+    Parse run log to split missed signals into four buckets:
+      no_fill      — order submitted but fill not confirmed
+      risk_blocked — blocked by risk engine (heat / sector cap / position cap)
+      regime_blocked — blocked by regime/momentum filter before risk engine
+      exec_failure — IBKR submission error
+    """
+    out = dict(no_fill=0, risk_blocked=0, regime_blocked=0, exec_failure=0)
+    log_file = last_run.get("log_file")
+    if not log_file:
+        return out
+    log_path = Path("logs") / log_file
+    if not log_path.exists():
+        return out
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return out
+
+    for line in content.splitlines():
+        # Regime / momentum block — happens in signals.py before risk engine
+        if re.search(r"blocked.{0,30}(regime|momentum|choppy)", line, re.I):
+            out["regime_blocked"] += 1
+        # Risk engine blocks — heat, sector, position cap
+        elif re.search(r"blocked.{0,40}(heat|sector|position|cap|budget)", line, re.I):
+            out["risk_blocked"] += 1
+        # Execution / fill failure
+        elif re.search(r"(fill failed|order failed|submission failed|ibkr error)", line, re.I):
+            out["exec_failure"] += 1
+        # No fill confirmation (order sent but no ack)
+        elif re.search(r"(no fill|unfilled|not filled)", line, re.I):
+            out["no_fill"] += 1
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Cool-down state management
+# ---------------------------------------------------------------------------
+
+def _business_days_since(from_date: date) -> int:
+    """Count business days elapsed from from_date to today (inclusive of today)."""
+    today = date.today()
+    if from_date > today:
+        return 0
+    return int(np.busday_count(from_date.isoformat(), today.isoformat()))
+
+
+def _load_cooldown_state() -> dict:
+    """
+    Load kill-condition cooldown state from results/kill_cooldown.json.
+    Schema: {triggered_date: "YYYY-MM-DD", conditions: [...], active: bool}
+    """
+    default = {"active": False, "triggered_date": None, "conditions": [], "days_elapsed": 0}
+    if not COOLDOWN_JSON.exists():
+        return default
+    try:
+        with open(COOLDOWN_JSON) as f:
+            data = json.load(f)
+        if data.get("active") and data.get("triggered_date"):
+            triggered = date.fromisoformat(data["triggered_date"])
+            elapsed   = _business_days_since(triggered)
+            data["days_elapsed"]   = elapsed
+            data["days_remaining"] = max(0, KILL_COOLDOWN_DAYS - elapsed)
+            if elapsed >= KILL_COOLDOWN_DAYS:
+                data["active"] = False   # cooldown expired
+        return data
+    except Exception:
+        return default
+
+
+def _save_cooldown_state(conditions: list[str]) -> None:
+    """
+    Write cooldown state.  Called when kill conditions first fire (today's date
+    becomes the trigger date) or when they clear after expiry.
+    Only sets triggered_date if not already active — preserves original trigger date.
+    """
+    try:
+        existing = {}
+        if COOLDOWN_JSON.exists():
+            with open(COOLDOWN_JSON) as f:
+                existing = json.load(f)
+
+        if conditions:
+            # Only stamp the date if we're not already in an active cooldown
+            if not existing.get("active"):
+                existing["triggered_date"] = date.today().isoformat()
+            existing["active"]     = True
+            existing["conditions"] = conditions
+        else:
+            # Conditions cleared — let cooldown expire naturally (keep triggered_date)
+            pass
+
+        COOLDOWN_JSON.parent.mkdir(parents=True, exist_ok=True)
+        with open(COOLDOWN_JSON, "w") as f:
+            json.dump(existing, f, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Soft breach counter
+# ---------------------------------------------------------------------------
+
+def _current_amber_metrics(roll30: dict, gs: dict) -> list[str]:
+    """
+    Return list of metric names currently in the amber zone (15–30% drift from BT).
+    Used to feed the soft breach counter.
+    """
+    amber = []
+
+    def _is_amber(val, bt_val, lower_is_better=False):
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return False
+        if bt_val == 0:
+            return False
+        drift = (val - bt_val) / abs(bt_val)
+        if lower_is_better:
+            drift = -drift
+        return -DRIFT_THRESHOLD < drift < -DRIFT_WARN   # amber band only
+
+    if _is_amber(roll30.get("avg_r"),         BT["avg_r"]):          amber.append("Avg R")
+    if _is_amber(roll30.get("win_rate"),       BT["win_rate"]):       amber.append("Win Rate")
+    if _is_amber(roll30.get("profit_factor"),  BT["profit_factor"]):  amber.append("Profit Factor")
+    if _is_amber(roll30.get("expectancy"),     BT["expectancy"]):     amber.append("Expectancy")
+    if _is_amber(gs.get("pct", 0.0), BT["gap_stop_pct"], lower_is_better=True):
+        amber.append("Gap Stop %")
+    return amber
+
+
+def _load_soft_breach_state() -> dict:
+    """
+    Load soft breach counter from results/soft_breach.json.
+    Schema: {consecutive_days: N, last_date: "YYYY-MM-DD", metrics: [...]}
+    """
+    default = {"consecutive_days": 0, "last_date": None, "metrics": []}
+    if not SOFT_BREACH_JSON.exists():
+        return default
+    try:
+        with open(SOFT_BREACH_JSON) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _update_soft_breach_state(roll30: dict, gs: dict, n_closed: int) -> dict:
+    """
+    Compare today's metrics against yesterday's state and update the counter.
+    Only runs once per calendar day (guards against dashboard re-renders).
+    Only active after data-collection phase.
+    Returns the current state dict.
+    """
+    state    = _load_soft_breach_state()
+    today_s  = date.today().isoformat()
+
+    # Don't update during data collection, and only update once per day
+    if n_closed < DATA_COLLECTION_TRADES or state.get("last_date") == today_s:
+        return state
+
+    amber_metrics = _current_amber_metrics(roll30, gs)
+
+    if amber_metrics:
+        # Only increment if we had amber yesterday too (consecutive)
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        was_amber_yesterday = (state.get("last_date") in (yesterday, today_s)
+                               and state.get("consecutive_days", 0) > 0)
+        state["consecutive_days"] = (state.get("consecutive_days", 0) + 1
+                                     if was_amber_yesterday else 1)
+    else:
+        state["consecutive_days"] = 0
+
+    state["last_date"] = today_s
+    state["metrics"]   = amber_metrics
+
+    try:
+        SOFT_BREACH_JSON.parent.mkdir(parents=True, exist_ok=True)
+        with open(SOFT_BREACH_JSON, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Chart builders
+# ---------------------------------------------------------------------------
+
+def _chart_equity(live_eq: pd.Series, bt_eq: pd.Series) -> go.Figure:
+    fig = go.Figure()
+    if not bt_eq.empty:
+        bt_norm = bt_eq / bt_eq.iloc[0] * STARTING_BALANCE
+        fig.add_trace(go.Scatter(
+            x=bt_norm.index, y=bt_norm.values,
+            mode="lines", name="Backtest",
+            line=dict(color="#404040", width=1, dash="dot"),
+        ))
+    if not live_eq.empty:
+        fig.add_trace(go.Scatter(
+            x=live_eq.index, y=live_eq.values,
+            mode="lines", name="Live",
+            line=dict(color=GREEN, width=2),
+            fill="tozeroy", fillcolor="rgba(38,166,154,0.07)",
+        ))
+    else:
+        fig.add_trace(go.Scatter(
+            x=[datetime.today()], y=[STARTING_BALANCE],
+            mode="markers", name="Start",
+            marker=dict(color=AMBER, size=8),
+        ))
+    fig.add_hline(y=STARTING_BALANCE, line_dash="dot", line_color="#333333", line_width=1)
+    layout = dict(**PLOT_LAYOUT, height=220)
+    layout["yaxis"] = dict(**PLOT_LAYOUT["yaxis"], tickprefix="$", tickformat=",.0f")
+    fig.update_layout(**layout, showlegend=True,
+                      legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0)", font=dict(size=10)))
+    return fig
+
+
+def _chart_drawdown(live_eq: pd.Series) -> go.Figure:
+    fig = go.Figure()
+    if not live_eq.empty:
+        dd = _compute_drawdown(live_eq)
+        fig.add_trace(go.Scatter(
+            x=dd.index, y=dd.values,
+            mode="lines", name="Drawdown",
+            line=dict(color=RED, width=1.5),
+            fill="tozeroy", fillcolor="rgba(239,83,80,0.12)",
+        ))
+        fig.add_hline(y=-BT["max_dd"], line_dash="dot", line_color="#555555", line_width=1,
+                      annotation_text=f"BT max −{BT['max_dd']}%",
+                      annotation_font_color="#888",
+                      annotation_position="bottom right")
+    layout = dict(**PLOT_LAYOUT, height=130)
+    layout["yaxis"] = dict(**PLOT_LAYOUT["yaxis"], ticksuffix="%")
+    fig.update_layout(**layout, showlegend=False)
+    return fig
+
+
+def _chart_heat_over_time(heat_series: pd.Series) -> go.Figure:
+    fig = go.Figure()
+    if not heat_series.empty:
+        colours = [RED if v > HEAT_BUDGET else AMBER if v > HEAT_BUDGET * 0.5 else GREEN
+                   for v in heat_series.values]
+        fig.add_trace(go.Scatter(
+            x=heat_series.index, y=heat_series.values,
+            mode="lines", name="Heat %",
+            line=dict(color=AMBER, width=1.5),
+            fill="tozeroy", fillcolor="rgba(245,166,35,0.08)",
+        ))
+        fig.add_hline(y=HEAT_BUDGET, line_dash="dot", line_color=RED, line_width=1,
+                      annotation_text=f"Budget {HEAT_BUDGET}%",
+                      annotation_font_color=RED,
+                      annotation_position="top right")
+    layout = dict(**PLOT_LAYOUT, height=180)
+    layout["yaxis"] = dict(**PLOT_LAYOUT["yaxis"], ticksuffix="%")
+    fig.update_layout(**layout, showlegend=False)
+    return fig
+
+
+def _chart_rolling_expectancy(roll_dict: dict[int, pd.Series], n_closed: int) -> go.Figure:
+    fig = go.Figure()
+    # Rolling 10: reduced opacity + dashed until 30 trades (low-confidence zone)
+    low_conf = n_closed < DATA_COLLECTION_TRADES
+    palette  = {10: BLUE, 30: GREEN, 50: AMBER}
+    for w, series in sorted(roll_dict.items()):
+        series_clean = series.dropna()
+        if series_clean.empty:
+            continue
+        is_10  = w == 10
+        opacity  = 0.35 if (is_10 and low_conf) else 1.0
+        dash     = "dot" if (is_10 and low_conf) else "solid"
+        width    = 1.0 if is_10 else 1.8
+        name     = f"Rolling {w}" + (" (low confidence)" if is_10 and low_conf else "")
+        fig.add_trace(go.Scatter(
+            x=list(range(len(series_clean))),
+            y=series_clean.values,
+            mode="lines", name=name,
+            opacity=opacity,
+            line=dict(color=palette.get(w, GREY), width=width, dash=dash),
+        ))
+    fig.add_hline(y=0, line_dash="dot", line_color="#333333", line_width=1)
+    fig.add_hline(y=BT["avg_r"], line_dash="dot", line_color="#404040", line_width=1,
+                  annotation_text=f"BT {BT['avg_r']}R",
+                  annotation_font_color="#888",
+                  annotation_position="top right")
+    # Shade the low-confidence region (first 30 trades)
+    if low_conf and roll_dict:
+        max_x = max(len(s.dropna()) for s in roll_dict.values()) if roll_dict else 0
+        if max_x > 0:
+            fig.add_vrect(
+                x0=0, x1=min(max_x, DATA_COLLECTION_TRADES),
+                fillcolor="rgba(245,166,35,0.05)",
+                line_width=0,
+                annotation_text="data collection",
+                annotation_position="top left",
+                annotation_font_color="#f5a623",
+                annotation_font_size=10,
+            )
+    layout = dict(**PLOT_LAYOUT, height=220)
+    layout["xaxis"] = dict(**PLOT_LAYOUT["xaxis"], title="Trade #")
+    layout["yaxis"] = dict(**PLOT_LAYOUT["yaxis"], ticksuffix="R")
+    fig.update_layout(**layout, showlegend=True,
+                      legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0)", font=dict(size=10)))
+    return fig
+
+
+def _chart_regime_dist(bt_trades: pd.DataFrame, live_merged: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    regime_col = None
+    for c in ["regime", "f_regime"]:
+        if c in bt_trades.columns:
+            regime_col = c
+            break
+    regimes = ["STRONG_BULL", "WEAK_BULL", "CHOPPY_BEAR"]
+    if regime_col and not bt_trades.empty:
+        bt_counts = bt_trades[regime_col].value_counts()
+        fig.add_trace(go.Bar(
+            name="Backtest", x=regimes,
+            y=[bt_counts.get(r, 0) for r in regimes],
+            marker_color=["rgba(38,166,154,0.35)", "rgba(245,166,35,0.35)", "rgba(239,83,80,0.35)"],
+        ))
+    if not live_merged.empty:
+        for c in ["f_regime", "regime", "regime_at_entry"]:
+            if c in live_merged.columns:
+                lv_counts = live_merged[c].value_counts()
+                fig.add_trace(go.Bar(
+                    name="Live", x=regimes,
+                    y=[lv_counts.get(r, 0) for r in regimes],
+                    marker_color=[GREEN, AMBER, RED],
+                ))
+                break
+    layout = dict(**PLOT_LAYOUT, height=180, barmode="group")
+    fig.update_layout(**layout, showlegend=True,
+                      legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0)", font=dict(size=10)))
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+def _metric(label: str, value: str, delta: str | None = None, delta_colour: str = GREY):
+    delta_html = (f'<div style="color:{delta_colour};font-size:12px;">{delta}</div>'
+                  if delta else "")
+    st.markdown(
+        f"""<div style="background:#161616;border:1px solid #2a2a2a;border-radius:8px;
+            padding:12px 16px;margin-bottom:4px;">
+          <div style="color:#888;font-size:11px;margin-bottom:4px;">{label}</div>
+          <div style="color:#e0e0e0;font-size:20px;font-weight:600;">{value}</div>
+          {delta_html}
+        </div>""",
+        unsafe_allow_html=True,
     )
 
 
-_lr = _parse_last_run()
+def _regime_pill(f_regime: str) -> str:
+    cls = {"STRONG_BULL": "pill-green", "WEAK_BULL": "pill-amber", "CHOPPY_BEAR": "pill-red"}
+    return f'<span class="pill {cls.get(f_regime, "pill-amber")}">{f_regime}</span>'
 
-if _lr:
-    _today       = date.today()
-    _ran_today   = (_lr.get("run_date") == _today)
-    _complete    = _lr.get("complete", False)
-    _run_dt      = _lr.get("run_date")
-    _run_tm      = _lr.get("run_time", "")
-    _steps       = _lr.get("steps", {})
-    _sc          = _lr.get("screener_count")
-    _sig         = _lr.get("signals_count")
-    _ord         = _lr.get("orders_placed")
-    _blocked     = _lr.get("orders_blocked", False)
-    _log_name    = _lr.get("log_file", "")
 
-    # ── "Ran today" / "Not run today" badge ───────────────────────────────
-    if _ran_today:
-        _run_badge = (
-            "<span style='background:#0d2b1e;color:#26a69a;"
-            "border:1px solid #26a69a55;border-radius:5px;"
-            "padding:3px 10px;font-size:11px;font-weight:700;"
-            "letter-spacing:0.04em'>RAN TODAY</span>"
-        )
-    else:
-        _run_badge = (
-            "<span style='background:#2b0d0d;color:#ef5350;"
-            "border:1px solid #ef535055;border-radius:5px;"
-            "padding:3px 10px;font-size:11px;font-weight:700;"
-            "letter-spacing:0.04em'>NOT RUN TODAY</span>"
-        )
-
-    # ── Datetime string ────────────────────────────────────────────────────
-    if _run_dt:
-        _dt_str = (
-            f"<span style='color:#666;font-size:12px'>"
-            f"Last run: {_run_dt.strftime('%a %d %b %Y')} &nbsp;·&nbsp; {_run_tm}"
-            f"</span>"
-        )
-    else:
-        _dt_str = ""
-
-    # ── Completion badge ───────────────────────────────────────────────────
-    if _complete:
-        _comp_badge = (
-            "<span style='color:#444;font-size:11px;margin-left:6px'>COMPLETE</span>"
-        )
-    else:
-        _comp_badge = (
-            "<span style='color:#5a3a0d;font-size:11px;margin-left:6px'>INCOMPLETE</span>"
-        )
-
-    # ── Per-step pills ─────────────────────────────────────────────────────
-    _pills_html = ""
-    for _skey in ["regime", "screener", "signals", "risk", "charts", "email", "ibkr", "exit_logger"]:
-        _sval = _steps.get(_skey)
-        _detail = ""
-        if _skey == "screener" and _sc is not None:
-            _detail = f"({_sc})"
-        elif _skey == "signals" and _sig is not None:
-            _detail = f"({_sig})"
-        elif _skey == "risk" and _blocked:
-            _detail = "(blocked)"
-        elif _skey == "risk" and _ord is not None and not _blocked:
-            _detail = f"({_ord} approved)"
-        elif _skey == "ibkr" and _sval == "ok" and _ord is not None:
-            _detail = f"({_ord} orders)"
-        elif _skey == "ibkr" and _sval == "warn":
-            _detail = "(no orders)"
-        _pills_html += _step_pill(_skey, _sval, _detail) + "&nbsp;"
-
-    # ── Summary counts row ─────────────────────────────────────────────────
-    _summary_parts = []
-    if _sc is not None:
-        _summary_parts.append(
-            f"<span style='color:#888;font-size:11px'>"
-            f"<strong style='color:#aaa'>{_sc}</strong> screened</span>"
-        )
-    if _sig is not None:
-        _sig_c = "#26a69a" if _sig > 0 else "#666"
-        _summary_parts.append(
-            f"<span style='color:#888;font-size:11px'>"
-            f"<strong style='color:{_sig_c}'>{_sig}</strong> signal{'s' if _sig != 1 else ''}</span>"
-        )
-    if _ord is not None:
-        _ord_c = "#26a69a" if _ord > 0 else "#666"
-        _summary_parts.append(
-            f"<span style='color:#888;font-size:11px'>"
-            f"<strong style='color:{_ord_c}'>{_ord}</strong> order{'s' if _ord != 1 else ''} placed</span>"
-        )
-    elif _blocked:
-        _summary_parts.append(
-            "<span style='color:#888;font-size:11px'>"
-            "<strong style='color:#f5a623'>0</strong> orders &mdash; portfolio full</span>"
-        )
-    _summary_html = (
-        " &nbsp;&middot;&nbsp; ".join(_summary_parts) if _summary_parts else ""
+def _phase_note():
+    st.markdown(
+        '<div class="phase-note">ℹ️ First 30 trades = data collection phase, not evaluation phase</div>',
+        unsafe_allow_html=True,
     )
 
-    st.markdown(f"""
-    <div style="background:#0f0f0f;border:1px solid #222;border-radius:8px;
-                padding:10px 16px;margin-bottom:10px">
-      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px">
-        {_run_badge}
-        {_dt_str}
-        {_comp_badge}
-        {"&nbsp;&nbsp;" + _summary_html if _summary_html else ""}
-        <span style="color:#333;font-size:10px;margin-left:auto">{_log_name}</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
-        {_pills_html}
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
 
-else:
-    st.markdown("""
-    <div style="background:#0f0f0f;border:1px solid #222;border-radius:8px;
-                padding:10px 16px;margin-bottom:10px">
-      <span style="background:#2b0d0d;color:#ef5350;border:1px solid #ef535055;
-                   border-radius:5px;padding:3px 10px;font-size:11px;font-weight:700;
-                   letter-spacing:0.04em">NOT RUN TODAY</span>
-      <span style="color:#555;font-size:12px;margin-left:12px">
-        No log files found in logs/ — run <code>python run_daily.py</code> to start.
-      </span>
-    </div>
-    """, unsafe_allow_html=True)
+def _safe_nan(v) -> bool:
+    """True if v is None or a float NaN."""
+    return v is None or (isinstance(v, float) and math.isnan(v))
 
+
+def _drift_colour(drift: float) -> str:
+    """Return colour string based on drift magnitude."""
+    if drift < -DRIFT_THRESHOLD:
+        return RED
+    if drift < -DRIFT_WARN:
+        return AMBER
+    return GREEN
+
+
+# ---------------------------------------------------------------------------
+# ── MAIN ────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# --- Load all data ---
+regime      = _load_regime()
+trades_df   = _load_trades()
+equity_df   = _load_equity()
+signals_df  = _load_signals()
+bt_eq       = _load_backtest_equity()
+bt_trades   = _load_backtest_trades()
+last_run    = _parse_last_run()
+
+# --- Derived ---
+live_eq              = _build_live_equity(equity_df)
+open_df, closed_df   = _split_trades(trades_df, equity_df)
+merged               = _enrich_closed(closed_df, equity_df)
+
+# --- Portfolio state ---
+n_open        = len(open_df)
+heat_pct      = float(open_df["risk_aud"].sum() / STARTING_BALANCE * 100) if (
+    not open_df.empty and "risk_aud" in open_df.columns) else 0.0
+exposure_pct  = n_open / MAX_POSITIONS * 100
+current_bal   = float(live_eq.iloc[-1]) if not live_eq.empty else STARTING_BALANCE
+total_pnl     = current_bal - STARTING_BALANCE
+total_ret     = total_pnl / STARTING_BALANCE * 100
+current_dd    = float(_compute_drawdown(live_eq).iloc[-1]) if not live_eq.empty else 0.0
+max_dd_live   = float(_compute_drawdown(live_eq).min())    if not live_eq.empty else 0.0
+
+# --- Paper trade detection ---
+has_paper = (not trades_df.empty and "paper" in trades_df.columns
+             and trades_df["paper"].astype(str).str.lower().eq("true").all())
+
+# --- Rolling stats ---
+roll30    = _rolling_metrics(merged, 30)
+cur_streak, max_streak = _losing_streak(merged)
+gs        = _gap_stop_stats(merged)
+missed    = _missed_trades_tracker(last_run, signals_df, trades_df)
+heat_ts   = _heat_over_time_series(trades_df, equity_df)
+roll_exp  = _rolling_expectancy_series(merged)
+quality   = _trade_quality_buckets(merged, signals_df)
+slip_decomp = _slippage_decomposition(merged, has_paper)
+regime_matrix = _regime_performance_matrix(merged)
+
+n_closed  = len(merged)
+
+# --- New derived: kill conditions, capital at risk, latency, missed breakdown ---
+kill_conditions  = _check_kill_conditions(roll30, gs, slip_decomp, regime_matrix, n_closed)
+cap_at_risk      = _capital_at_risk(open_df, current_bal)
+exec_latency_s   = _parse_execution_latency(last_run)
+missed_breakdown = _parse_missed_breakdown(last_run)
+
+# --- Cool-down: persist trigger date on first fire; load current state ---
+if kill_conditions:
+    _save_cooldown_state(kill_conditions)
+cooldown_state  = _load_cooldown_state()
+
+# --- Soft breach: update counter once per day, load current state ---
+soft_breach     = _update_soft_breach_state(roll30, gs, n_closed)
 
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
-col_title, col_refresh = st.columns([5, 1])
-with col_title:
+f_regime   = regime.get("f_regime", "STRONG_BULL")
+regime_mlt = regime.get("f_regime_size_multiplier", 1.0)
+ts_str     = (regime.get("timestamp", "")[:16] or "—")
+
+hcol1, hcol2, hcol3 = st.columns([3, 1, 1])
+with hcol1:
     st.markdown(
-        f"<h1 style='color:#f5a623;font-size:24px;margin:0'>K ASX Swing Engine</h1>"
-        f"<p style='color:#555;font-size:12px;margin:2px 0 0'>"
-        f"Last loaded: {datetime.now().strftime('%a %d %b %Y  %H:%M:%S')} "
-        f"&nbsp;·&nbsp; Auto-refresh every 5 min</p>",
+        f"## ASX Swing Engine &nbsp;·&nbsp; "
+        f"{_regime_pill(f_regime)} &nbsp; "
+        f"<span style='color:#888;font-size:13px;'>size ×{regime_mlt:.1f} · "
+        f"updated {ts_str}</span>",
         unsafe_allow_html=True,
     )
-with col_refresh:
-    if st.button("Refresh now", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+with hcol2:
+    run_status = ("✅ complete" if last_run.get("complete")
+                  else "⚠️ partial" if last_run else "—")
+    st.markdown(
+        f"<div style='text-align:right;color:#888;font-size:12px;margin-top:18px;'>"
+        f"Last run {last_run.get('run_date','—')} {last_run.get('run_time','')}"
+        f"<br/>{run_status}</div>",
+        unsafe_allow_html=True,
+    )
+with hcol3:
+    refresh_placeholder = st.empty()
 
-st.markdown("---")
+st.markdown("<hr style='margin:4px 0 16px 0;'>", unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# Regime status bar
-# ---------------------------------------------------------------------------
-_REGIME_COLOURS = {
-    "BULL":      "#26a69a",
-    "WEAK_BULL": "#9ccc65",
-    "CHOPPY":    "#f5a623",
-    "BEAR":     "#ef5350",
-    "HIGH_VOL": "#9c27b0",
-}
-_REGIME_BG = {
-    "BULL":      "#0d2b1e",
-    "WEAK_BULL": "#1a2b0d",
-    "CHOPPY":    "#2b1e0d",
-    "BEAR":      "#2b0d0d",
-    "HIGH_VOL":  "#1e0d2b",
-}
+# ===========================================================================
+# ⚠️  KILL CONDITIONS BANNER  — shown before everything else if triggered
+# ===========================================================================
 
-_rd            = _load_regime()
-_regime_name   = _rd.get("regime", "UNKNOWN")
-_confidence    = _rd.get("confidence", None)
-_ts            = _rd.get("timestamp", None)
-_ind           = _rd.get("indicators", {})
-_dual_momentum = _rd.get("dual_momentum_penalty", False)
+_cd_active    = cooldown_state.get("active", False)
+_cd_remaining = cooldown_state.get("days_remaining", 0)
+_cd_elapsed   = cooldown_state.get("days_elapsed", 0)
+_cd_triggered = cooldown_state.get("triggered_date", "—")
+_cd_conditions= cooldown_state.get("conditions", kill_conditions)
 
-if _regime_name in _REGIME_COLOURS:
-    _badge_colour = _REGIME_COLOURS[_regime_name]
-    _badge_bg     = _REGIME_BG[_regime_name]
-    _conf_str     = f"Confidence: {_confidence}%" if _confidence is not None else ""
-    _ts_str       = (
-        f"<span style='color:#444;font-size:11px'>Classified: {_ts}</span>"
-        if _ts else ""
+if kill_conditions or _cd_active:
+    # Use current conditions if fresh, otherwise show what triggered the cooldown
+    display_conditions = kill_conditions if kill_conditions else _cd_conditions
+    items_html = "".join(
+        f'<div class="kill-item">⛔ {cond}</div>' for cond in display_conditions
     )
 
-    # Key indicator snippets
-    _xjo   = _ind.get("xjo_close")
-    _e200  = _ind.get("ema_200")
-    _roc   = _ind.get("roc_20")
-    _slope = _ind.get("ema_50_slope")
-    _brd   = _ind.get("market_breadth")
-    _atr_p = _ind.get("atr_pct")
-
-    _ind_parts = []
-    if _xjo is not None and _e200 is not None and _e200 != 0:
-        _vs200   = (_xjo - _e200) / _e200 * 100
-        _vs200_c = "#26a69a" if _vs200 >= 0 else "#ef5350"
-        _ind_parts.append(
-            f"XJO <strong>{_xjo:,.0f}</strong> "
-            f"<span style='color:{_vs200_c}'>{_vs200:+.1f}% vs 200 EMA</span>"
+    if _cd_remaining > 0:
+        cooldown_html = (
+            f'<div style="margin-top:12px;padding:10px 14px;background:#2b0505;'
+            f'border-radius:6px;border:1px solid #ef535055;">'
+            f'<span style="color:#ef5350;font-weight:700;font-size:14px;">'
+            f'⏳ COOL-DOWN: {_cd_remaining} trading day{"s" if _cd_remaining != 1 else ""} remaining</span>'
+            f'<span style="color:#888;font-size:12px;"> · triggered {_cd_triggered} · '
+            f'{_cd_elapsed}/{KILL_COOLDOWN_DAYS} days elapsed</span>'
+            f'<div style="color:#aaa;font-size:11px;margin-top:4px;">'
+            f'No new entries until cooldown expires. '
+            f'Manually delete <code>results/kill_cooldown.json</code> to override.</div>'
+            f'</div>'
         )
-    if _roc is not None:
-        _roc_c = "#26a69a" if _roc >= 0 else "#ef5350"
-        _ind_parts.append(f"ROC-20 <span style='color:{_roc_c}'>{_roc:+.1f}%</span>")
-    if _slope is not None:
-        _slope_c = "#26a69a" if _slope >= 0 else "#ef5350"
-        _ind_parts.append(
-            f"50 EMA slope <span style='color:{_slope_c}'>{_slope:+.2f}%</span>"
+    elif _cd_active and _cd_remaining == 0:
+        cooldown_html = (
+            f'<div style="margin-top:12px;padding:8px 14px;background:#0d1a0d;'
+            f'border-radius:6px;border:1px solid #26a69a55;">'
+            f'<span style="color:#26a69a;font-weight:600;">✅ Cooldown period expired</span>'
+            f'<span style="color:#888;font-size:12px;"> · triggered {_cd_triggered} · '
+            f'resolve conditions above before resuming</span>'
+            f'</div>'
         )
-    if _brd is not None:
-        _ind_parts.append(f"Breadth <strong>{_brd:.0f}%</strong>")
-    if _atr_p is not None:
-        _ind_parts.append(f"ATR <strong>{_atr_p:.1f}%</strong>")
+    else:
+        cooldown_html = (
+            f'<div style="color:#888;font-size:11px;margin-top:10px;">'
+            f'Do not place new entries until conditions resolve. '
+            f'Cooldown ({KILL_COOLDOWN_DAYS} trading days) will start from today.</div>'
+        )
 
-    _ind_html = (
-        "<span style='color:#666;font-size:11px'>"
-        + " &nbsp;&middot;&nbsp; ".join(_ind_parts)
-        + "</span>"
-        if _ind_parts else ""
+    st.markdown(
+        f"""<div class="kill-banner">
+          <div class="kill-banner-title">🛑 TRADING PAUSED — KILL CONDITIONS TRIGGERED</div>
+          {items_html}
+          {cooldown_html}
+        </div>""",
+        unsafe_allow_html=True,
     )
 
-    # Dual momentum note (informational only — no sizing effect)
-    _dual_html = ""
-    if _dual_momentum:
-        _dual_html = (
-            "<span style='background:#1a1a1a;color:#888;border:1px solid #33333366;"
-            "border-radius:6px;padding:2px 10px;font-size:11px;"
-            "letter-spacing:0.04em' "
-            "title='Both ROC-20 and EMA-50 slope negative — market context only'>"
-            "DUAL MOMENTUM</span>"
-        )
-
-    # Informational-only label
-    _info_label = (
-        "<span style='background:#1a1a2a;color:#5577aa;border:1px solid #33448866;"
-        "border-radius:6px;padding:2px 10px;font-size:10px;font-weight:600;"
-        "letter-spacing:0.06em'>MARKET CONTEXT</span>"
+elif n_closed >= DATA_COLLECTION_TRADES:
+    st.markdown(
+        '<div class="kill-clear">✅ All kill conditions clear — system operating within parameters</div>',
+        unsafe_allow_html=True,
     )
-
-    st.markdown(f"""
-    <div style="background:#111111;border:1px solid #2a2a2a;border-radius:8px;
-                padding:12px 18px;display:flex;align-items:center;
-                justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:8px">
-      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
-        {_info_label}
-        <span style="background:{_badge_bg};color:{_badge_colour};
-                     border:1px solid {_badge_colour}66;border-radius:6px;
-                     padding:4px 14px;font-size:15px;font-weight:800;
-                     letter-spacing:0.08em">{_regime_name}</span>
-        <span style="color:#777;font-size:13px">{_conf_str}</span>
-        {_dual_html}
-        {_ind_html}
-      </div>
-      <div style="text-align:right">{_ts_str}</div>
-    </div>
-    """, unsafe_allow_html=True)
 else:
-    # regime.json missing or regime key unrecognised
-    st.markdown("""
-    <div style="background:#111111;border:1px solid #2a2a2a;border-radius:8px;
-                padding:12px 18px;display:flex;align-items:center;gap:16px;margin-bottom:8px">
-      <span style="background:#1a1a2a;color:#5577aa;border:1px solid #33448866;
-                   border-radius:6px;padding:2px 10px;font-size:10px;
-                   font-weight:600;letter-spacing:0.06em">MARKET CONTEXT</span>
-      <span style="background:#1e1e1e;color:#666;border:1px solid #33333366;
-                   border-radius:6px;padding:4px 14px;font-size:15px;
-                   font-weight:800;letter-spacing:0.08em">UNKNOWN</span>
-      <span style="color:#555;font-size:13px">Run pipeline to classify</span>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="phase-note" style="margin-bottom:14px;">'
+        f'ℹ️ Kill conditions inactive — data collection phase ({n_closed}/{DATA_COLLECTION_TRADES} trades)</div>',
+        unsafe_allow_html=True,
+    )
 
-# ---------------------------------------------------------------------------
-# Auto-refresh via meta tag injection
-# ---------------------------------------------------------------------------
+# --- Soft breach warning (separate from kill — shown independently) ---
+_sb_days    = soft_breach.get("consecutive_days", 0)
+_sb_metrics = soft_breach.get("metrics", [])
+if _sb_days >= SOFT_BREACH_WARN_DAYS:
+    metrics_str = ", ".join(_sb_metrics) if _sb_metrics else "multiple metrics"
+    st.markdown(
+        f'<div style="background:#1a1500;border:1px solid {AMBER};border-radius:8px;'
+        f'padding:12px 18px;margin-bottom:12px;">'
+        f'<span style="color:{AMBER};font-weight:700;">⚠️ SOFT BREACH: {_sb_days} consecutive days in amber</span>'
+        f'<span style="color:#888;font-size:12px;"> · {metrics_str} drifting 15–30% from backtest</span>'
+        f'<div style="color:#aaa;font-size:11px;margin-top:4px;">'
+        f'Manual review recommended. Not a kill condition, but trend is deteriorating.</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+elif _sb_days > 0 and n_closed >= DATA_COLLECTION_TRADES:
+    metrics_str = ", ".join(_sb_metrics) if _sb_metrics else "metrics"
+    st.markdown(
+        f'<div class="phase-note" style="margin-bottom:10px;">'
+        f'🟡 {_sb_days} day{"s" if _sb_days != 1 else ""} in amber ({metrics_str}) — '
+        f'watch for {SOFT_BREACH_WARN_DAYS - _sb_days} more consecutive day{"s" if SOFT_BREACH_WARN_DAYS - _sb_days != 1 else ""} to trigger review</div>',
+        unsafe_allow_html=True,
+    )
+
+# ===========================================================================
+# ROW 1 — PORTFOLIO HEALTH
+# ===========================================================================
+st.markdown("## 📊 Portfolio Health")
+
+ph_left, ph_mid, ph_right = st.columns([5, 3, 2])
+
+with ph_left:
+    st.markdown("**Equity Curve — Live vs Backtest**")
+    st.plotly_chart(_chart_equity(live_eq, bt_eq),
+                    use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(_chart_drawdown(live_eq),
+                    use_container_width=True, config={"displayModeBar": False})
+
+with ph_mid:
+    st.markdown("**Account**")
+    _metric("Account Balance", f"${current_bal:,.0f}",
+            delta=f"{total_pnl:+,.0f} ({total_ret:+.1f}%)",
+            delta_colour=GREEN if total_pnl >= 0 else RED)
+    dd_clr = RED if current_dd < -3 else AMBER if current_dd < 0 else GREEN
+    _metric("Current Drawdown", f"{current_dd:.1f}%",
+            delta=f"Max {max_dd_live:.1f}% · BT max −{BT['max_dd']}%",
+            delta_colour=dd_clr)
+    _metric("Closed Trades", str(n_closed))
+
+with ph_right:
+    st.markdown("**Exposure**")
+    heat_clr = RED if heat_pct > HEAT_BUDGET * 0.8 else AMBER if heat_pct > HEAT_BUDGET * 0.5 else GREEN
+    _metric("Open Positions", f"{n_open} / {MAX_POSITIONS}")
+    _metric("Exposure %",     f"{exposure_pct:.0f}%")
+    _metric("Heat %",         f"{heat_pct:.1f}%",
+            delta=f"Budget {HEAT_BUDGET}%", delta_colour=heat_clr)
+    # Capital at risk: worst-case if all stops hit tonight
+    car_aud = cap_at_risk["max_loss_aud"]
+    car_pct = cap_at_risk["max_loss_pct"]
+    car_clr = RED if car_pct > 5 else AMBER if car_pct > 3 else GREEN
+    _metric(
+        "Capital at Risk Tomorrow",
+        f"−${car_aud:,.0f}",
+        delta=f"−{car_pct:.1f}% of account · if ALL stops hit",
+        delta_colour=car_clr,
+    )
+
+if not open_df.empty:
+    st.markdown("**Open Positions**")
+    cols_show = [c for c in ["timestamp","ticker","shares","entry","stop_loss","target","risk_aud"]
+                 if c in open_df.columns]
+    disp = open_df[cols_show].copy()
+    if "timestamp" in disp.columns:
+        disp["timestamp"] = pd.to_datetime(disp["timestamp"]).dt.strftime("%Y-%m-%d")
+    if "risk_aud" in disp.columns:
+        disp["risk_aud"] = disp["risk_aud"].map(lambda x: f"${x:.0f}")
+    st.dataframe(disp, use_container_width=True, hide_index=True)
+else:
+    st.info("No open positions.", icon="💤")
+
+# ===========================================================================
+# ROW 2 — EDGE VALIDATION
+# ===========================================================================
 st.markdown(
-    f"<meta http-equiv='refresh' content='{REFRESH_SECS}'>",
+    "## 🎯 Edge Validation  "
+    "<span style='color:#888;font-size:12px;'>(last 30 closed trades)</span>",
     unsafe_allow_html=True,
 )
 
-# ---------------------------------------------------------------------------
-# 1. Today's signals
-# ---------------------------------------------------------------------------
-st.markdown("## Today's Signals")
+ev1, ev2, ev3, ev4, ev5, ev6, ev7 = st.columns(7)
 
-signals = _load_signals()
+def _safe_pct(v, bt_v, lower_is_better=False):
+    """Return delta colour based on live vs BT with amber/red thresholds."""
+    if _safe_nan(v) or bt_v == 0:
+        return GREY
+    drift = (v - bt_v) / abs(bt_v)
+    if lower_is_better:
+        drift = -drift
+    return _drift_colour(drift)
 
-if signals.empty:
-    st.info("No signals file found at results/signals_output.csv - run signals.py first.")
-else:
-    # Trigger badge column
-    def _trigger_badges(row):
-        badges = []
-        if row.get("t_rsi_bounce"):  badges.append('<span class="pill pill-green">RSI</span>')
-        if row.get("t_macd_cross"):  badges.append('<span class="pill pill-amber">MACD</span>')
-        if row.get("t_vol_break"):   badges.append('<span class="pill pill-green">VOL</span>')
-        return " ".join(badges)
+with ev1:
+    wr  = roll30["win_rate"]
+    _metric("Win Rate",       f"{wr:.1f}%" if not _safe_nan(wr) else "—",
+            delta=f"BT {BT['win_rate']}%", delta_colour=_safe_pct(wr, BT["win_rate"]))
+with ev2:
+    pf  = roll30["profit_factor"]
+    _metric("Profit Factor",  f"{pf:.2f}" if not _safe_nan(pf) else "—",
+            delta=f"BT {BT['profit_factor']}", delta_colour=_safe_pct(pf, BT["profit_factor"]))
+with ev3:
+    exp = roll30["expectancy"]
+    _metric("Expectancy",     f"${exp:.0f}" if not _safe_nan(exp) else "—",
+            delta=f"BT ${BT['expectancy']:.0f}", delta_colour=_safe_pct(exp, BT["expectancy"]))
+with ev4:
+    ar  = roll30["avg_r"]
+    _metric("Avg R / Trade",  f"{ar:.3f}R" if not _safe_nan(ar) else "—",
+            delta=f"BT {BT['avg_r']}R", delta_colour=_safe_pct(ar, BT["avg_r"]))
+with ev5:
+    slip_str = "0.00%" if has_paper else "N/A"
+    _metric("Avg Entry Slip", slip_str,
+            delta="BT assumption 0.20%",
+            delta_colour=GREEN if has_paper else GREY)
+with ev6:
+    sigs   = last_run.get("signals_count") or 0
+    placed = last_run.get("orders_placed") or 0
+    _metric("Fill Rate (today)", f"{placed}/{sigs}" if sigs else "—",
+            delta="signals → placed")
 
-    display_sig = signals[[
-        "rank", "ticker", "entry", "stop_loss", "target",
-        "trigger_count", "composite_score", "rs_vs_xjo", "momentum_20d",
-        "t_rsi_bounce", "t_macd_cross", "t_vol_break",
-    ]].copy()
+with ev7:
+    if exec_latency_s is not None:
+        lat_clr = RED if exec_latency_s > 120 else AMBER if exec_latency_s > 60 else GREEN
+        lat_str = (f"{exec_latency_s:.0f}s"
+                   if exec_latency_s < 60 else f"{exec_latency_s/60:.1f}m")
+        _metric("Exec Latency", lat_str,
+                delta="signal scan → first order",
+                delta_colour=lat_clr)
+    else:
+        _metric("Exec Latency", "—",
+                delta="signal scan → first order")
 
-    display_sig["risk $"] = ((display_sig["entry"] - display_sig["stop_loss"])
-                              .apply(lambda x: f"${x:.3f}"))
-    display_sig["r:r"]    = (
-        (display_sig["target"] - display_sig["entry"])
-        / (display_sig["entry"] - display_sig["stop_loss"])
-    ).apply(lambda x: f"{x:.1f}:1")
+_phase_note()
 
-    # Build HTML table
-    rows_html = ""
-    for _, r in display_sig.iterrows():
-        badges = _trigger_badges(r)
-        score_c = "#26a69a" if r["composite_score"] >= 70 else (
-                  "#f5a623" if r["composite_score"] >= 50 else "#ef5350")
-        rs_c  = _colour(r["rs_vs_xjo"])
-        mom_c = _colour(r["momentum_20d"])
-        rows_html += f"""
-        <tr style="border-bottom:1px solid #1e1e1e">
-          <td style="padding:8px 10px;color:#555">{int(r['rank'])}</td>
-          <td style="padding:8px 10px;font-weight:700;color:#e0e0e0">{r['ticker'].replace('.AX','')}</td>
-          <td style="padding:8px 10px;text-align:right">${r['entry']:.3f}</td>
-          <td style="padding:8px 10px;text-align:right;color:{RED}">${r['stop_loss']:.3f}</td>
-          <td style="padding:8px 10px;text-align:right;color:{GREEN}">${r['target']:.3f}</td>
-          <td style="padding:8px 10px;text-align:center;color:{score_c};font-weight:700">{r['composite_score']:.1f}</td>
-          <td style="padding:8px 10px;text-align:right;color:{rs_c}">{r['rs_vs_xjo']:+.1f}%</td>
-          <td style="padding:8px 10px;text-align:right;color:{mom_c}">{r['momentum_20d']:+.1f}%</td>
-          <td style="padding:8px 10px">{badges}</td>
-        </tr>"""
+# ===========================================================================
+# MISSED TRADES TRACKER
+# ===========================================================================
+st.markdown("## 🔍 Missed Trades Tracker")
+st.markdown(
+    "<span style='color:#888;font-size:12px;'>Today's run · "
+    "Hypothetical P&L uses backtest avg R × avg trade risk</span>",
+    unsafe_allow_html=True,
+)
 
-    st.markdown(f"""
-    <table style="width:100%;border-collapse:collapse;font-size:13px;background:#111111;border-radius:8px;overflow:hidden">
-      <thead>
-        <tr style="background:#1e1e1e;color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.05em">
-          <th style="padding:10px;text-align:left">#</th>
-          <th style="padding:10px;text-align:left">Ticker</th>
-          <th style="padding:10px;text-align:right">Entry</th>
-          <th style="padding:10px;text-align:right">Stop</th>
-          <th style="padding:10px;text-align:right">Target</th>
-          <th style="padding:10px;text-align:center">Score</th>
-          <th style="padding:10px;text-align:right">RS vs XJO</th>
-          <th style="padding:10px;text-align:right">Mom 20d</th>
-          <th style="padding:10px;text-align:left">Triggers</th>
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>
-    """, unsafe_allow_html=True)
+mt1, mt2, mt3, mt4, mt5 = st.columns(5)
 
-st.markdown("---")
+with mt1:
+    _metric("Signals Generated", str(missed["generated"]),
+            delta="RS + trigger scan (before regime filter)")
+with mt2:
+    _metric("Eligible After Filters", str(missed["eligible"]),
+            delta="Passed regime / momentum gate")
+with mt3:
+    blocked_by_regime = max(0, missed["generated"] - missed["eligible"])
+    _metric("Blocked by Regime", str(blocked_by_regime),
+            delta="CHOPPY_BEAR momentum filter",
+            delta_colour=AMBER if blocked_by_regime > 0 else GREEN)
+with mt4:
+    _metric("Executed", str(missed["executed"]),
+            delta="Orders placed (heat / sector / cap)",
+            delta_colour=GREEN if missed["executed"] > 0 else GREY)
+with mt5:
+    hypo_str = (f"+{missed['hypo_r']:.2f}R / ${missed['hypo_pnl']:+,.0f}"
+                if missed["missed"] > 0 else "—")
+    _metric("Missed (cap/heat)", str(missed["missed"]),
+            delta=f"Hypothetical: {hypo_str}",
+            delta_colour=AMBER if missed["missed"] > 0 else GREEN)
 
-# ---------------------------------------------------------------------------
-# 2. Open trades  (deduplicate: keep latest row per ticker per day)
-# ---------------------------------------------------------------------------
-st.markdown("## Open Trades")
+# Missed trades breakdown by reason (parsed from log)
+total_breakdown = sum(missed_breakdown.values())
+if total_breakdown > 0:
+    st.markdown(
+        "<span style='color:#888;font-size:12px;font-style:italic;'>"
+        "Missed breakdown by reason (from run log):</span>",
+        unsafe_allow_html=True,
+    )
+    mb1, mb2, mb3, mb4 = st.columns(4)
+    bd_colour = lambda n: AMBER if n > 0 else GREY
+    with mb1:
+        _metric("Blocked by Regime",
+                str(missed_breakdown["regime_blocked"]),
+                delta="momentum gate / f_regime filter",
+                delta_colour=bd_colour(missed_breakdown["regime_blocked"]))
+    with mb2:
+        _metric("Blocked by Risk Engine",
+                str(missed_breakdown["risk_blocked"]),
+                delta="heat budget / sector cap / position limit",
+                delta_colour=bd_colour(missed_breakdown["risk_blocked"]))
+    with mb3:
+        _metric("Execution Failure",
+                str(missed_breakdown["exec_failure"]),
+                delta="IBKR submission error",
+                delta_colour=RED if missed_breakdown["exec_failure"] > 0 else GREY)
+    with mb4:
+        _metric("No Fill",
+                str(missed_breakdown["no_fill"]),
+                delta="order sent, fill not confirmed",
+                delta_colour=RED if missed_breakdown["no_fill"] > 0 else GREY)
 
-trades_raw = _load_trades()
+# ===========================================================================
+# ROW 3 — SYSTEM DIAGNOSTICS
+# ===========================================================================
+st.markdown("## 🔬 System Diagnostics")
 
-if trades_raw.empty:
-    st.info("No trades logged yet - logs/trades.csv is empty.")
-else:
-    # Keep latest submission per ticker (most recent order_ref wins)
-    trades = (trades_raw
-              .sort_values("timestamp")
-              .drop_duplicates(subset="ticker", keep="last")
-              .copy())
+sd1, sd2, sd3, sd4 = st.columns(4)
 
-    tickers = trades["ticker"].tolist()
-    live_prices = _fetch_prices(tickers)
+with sd1:
+    st.markdown("**Regime Performance Matrix**")
+    st.caption("Validates Variant F's core thesis: CHOPPY_BEAR underperforms STRONG_BULL")
+    if not regime_matrix.empty:
+        def _style_regime(df):
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            for i, row in df.iterrows():
+                regime_val = row["Regime"]
+                colour = {"STRONG_BULL": GREEN, "WEAK_BULL": AMBER, "CHOPPY_BEAR": RED}.get(regime_val, GREY)
+                styles.loc[i, "Regime"] = f"color: {colour}; font-weight: 600"
+            return styles
+        st.dataframe(
+            regime_matrix.style.apply(_style_regime, axis=None),
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        st.plotly_chart(_chart_regime_dist(bt_trades, merged),
+                        use_container_width=True, config={"displayModeBar": False})
+        st.caption("No live trades yet — showing backtest regime distribution.")
 
-    rows_open = ""
-    total_unrealised = 0.0
+with sd2:
+    st.markdown("**Slippage Decomposition**")
+    entry_slip = "0.00%" if has_paper else "N/A"
+    _metric("Entry Slippage", entry_slip,
+            delta="Paper: signal px = fill px")
 
-    for _, r in trades.iterrows():
-        tk      = r["ticker"]
-        symbol  = tk.replace(".AX", "")
-        ep      = r["entry"]
-        sl      = r["stop_loss"]
-        tgt     = r["target"]
-        shares  = r["shares"]
-        risk    = r["risk_aud"]
+    es = slip_decomp["exit_slip_r"]
+    _metric("Normal Stop Slip",
+            f"{es:+.3f}R" if not _safe_nan(es) else "—",
+            delta="deviation from −1R",
+            delta_colour=RED if (not _safe_nan(es) and es < -0.05) else GREEN)
 
-        last    = live_prices.get(tk, np.nan)
-        if not math.isnan(last):
-            pnl_aud = (last - ep) * shares
-            pnl_r   = (last - ep) / (ep - sl) if (ep - sl) != 0 else 0.0
-            pnl_c   = _colour(pnl_aud)
-            price_s = f"${last:.3f}"
-            pnl_s   = f'<span style="color:{pnl_c}">{_fmt_aud(pnl_aud)} ({pnl_r:+.2f}R)</span>'
-            total_unrealised += pnl_aud
+    ge = slip_decomp["gap_excess_r"]
+    _metric("Gap Excess Loss",
+            f"{ge:+.3f}R" if not _safe_nan(ge) else "—",
+            delta="gap stop avg vs −1R expected",
+            delta_colour=RED if (not _safe_nan(ge) and ge < -0.1) else AMBER)
+
+    ts_slip = slip_decomp["target_slip_r"]
+    _metric("Target Exit Slip",
+            f"{ts_slip:+.3f}R" if not _safe_nan(ts_slip) else "—",
+            delta="deviation from +2R",
+            delta_colour=RED if (not _safe_nan(ts_slip) and ts_slip < -0.1) else GREEN)
+
+with sd3:
+    st.markdown("**Trade Lifecycle**")
+    if not merged.empty:
+        if "holding_days" in merged.columns:
+            avg_hold = round(float(merged["holding_days"].mean()), 1)
+        elif "exit_date" in merged.columns and "timestamp" in merged.columns:
+            avg_hold = round(float(
+                (pd.to_datetime(merged["exit_date"]) - pd.to_datetime(merged["timestamp"]))
+                .dt.days.mean()
+            ), 1)
         else:
-            price_s = "<span style='color:#555'>n/a</span>"
-            pnl_s   = "<span style='color:#555'>--</span>"
+            avg_hold = np.nan
+        _metric("Avg Hold Days", f"{avg_hold:.1f}d" if not _safe_nan(avg_hold) else "—",
+                delta=f"BT {BT['avg_hold_days']}d")
+        exits_bd = _exit_type_breakdown(merged)
+        if exits_bd:
+            total_ex = sum(exits_bd.values())
+            bd_rows  = [{"Exit Type": k, "Count": v, "%": f"{v/total_ex*100:.0f}%"}
+                        for k, v in sorted(exits_bd.items(), key=lambda x: -x[1])]
+            st.dataframe(pd.DataFrame(bd_rows), use_container_width=True, hide_index=True)
+    else:
+        _metric("Avg Hold Days", "—")
 
-        dist_sl  = (last - sl)  / sl  * 100 if not math.isnan(last) else np.nan
-        dist_tgt = (tgt - last) / last * 100 if not math.isnan(last) else np.nan
+with sd4:
+    st.markdown("**Losing Streak Tracker**")
+    streak_clr = RED if cur_streak >= BT["max_consec_loss"] else AMBER if cur_streak >= 2 else GREEN
+    _metric("Current Streak", f"{cur_streak} losses",
+            delta=f"Max ever {max_streak} · BT max {BT['max_consec_loss']}",
+            delta_colour=streak_clr)
+    if not merged.empty and "pnl_r" in merged.columns:
+        recent20 = merged.tail(20)["pnl_r"].values
+        fig_str  = go.Figure()
+        fig_str.add_trace(go.Bar(
+            x=list(range(len(recent20))),
+            y=recent20,
+            marker_color=[GREEN if r > 0 else RED for r in recent20],
+            showlegend=False,
+        ))
+        layout_s = dict(**PLOT_LAYOUT, height=160)
+        layout_s["xaxis"] = dict(**PLOT_LAYOUT["xaxis"], showticklabels=False)
+        layout_s["yaxis"] = dict(**PLOT_LAYOUT["yaxis"], ticksuffix="R")
+        fig_str.update_layout(**layout_s)
+        st.plotly_chart(fig_str, use_container_width=True, config={"displayModeBar": False})
 
-        ts_date = pd.to_datetime(r["timestamp"]).strftime("%d %b")
-        mode    = '<span class="pill pill-amber">PAPER</span>' if r.get("paper") else \
-                  '<span class="pill pill-red">LIVE</span>'
-
-        rows_open += f"""
-        <tr style="border-bottom:1px solid #1e1e1e">
-          <td style="padding:8px 10px;font-weight:700;color:#e0e0e0">{symbol}</td>
-          <td style="padding:8px 10px;color:#888">{ts_date}</td>
-          <td style="padding:8px 10px;text-align:right">${ep:.3f}</td>
-          <td style="padding:8px 10px;text-align:right">{price_s}</td>
-          <td style="padding:8px 10px;text-align:right">{pnl_s}</td>
-          <td style="padding:8px 10px;text-align:right;color:{RED}">${sl:.3f}</td>
-          <td style="padding:8px 10px;text-align:right;color:{GREEN}">${tgt:.3f}</td>
-          <td style="padding:8px 10px;text-align:right">{shares:,}</td>
-          <td style="padding:8px 10px;text-align:center">{mode}</td>
-        </tr>"""
-
-    unrealised_c = _colour(total_unrealised)
-    summary_line = (f'<p style="text-align:right;color:{unrealised_c};font-size:13px;margin:6px 0 0">'
-                    f'Unrealised P&amp;L: <strong>{_fmt_aud(total_unrealised)}</strong></p>')
-
-    st.markdown(f"""
-    <table style="width:100%;border-collapse:collapse;font-size:13px;background:#111111;border-radius:8px;overflow:hidden">
-      <thead>
-        <tr style="background:#1e1e1e;color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.05em">
-          <th style="padding:10px;text-align:left">Ticker</th>
-          <th style="padding:10px;text-align:left">Date</th>
-          <th style="padding:10px;text-align:right">Entry</th>
-          <th style="padding:10px;text-align:right">Last</th>
-          <th style="padding:10px;text-align:right">Unreal. P&amp;L</th>
-          <th style="padding:10px;text-align:right">Stop</th>
-          <th style="padding:10px;text-align:right">Target</th>
-          <th style="padding:10px;text-align:right">Shares</th>
-          <th style="padding:10px;text-align:center">Mode</th>
-        </tr>
-      </thead>
-      <tbody>{rows_open}</tbody>
-    </table>
-    {summary_line}
-    """, unsafe_allow_html=True)
-
-st.markdown("---")
-
-# ---------------------------------------------------------------------------
-# 3. Live P&L  (full width)
-# ---------------------------------------------------------------------------
-st.markdown("## Live P&amp;L")
-
-equity_df    = _load_equity()
-bt_equity    = _load_backtest_equity()
-
-# ── summary metrics ─────────────────────────────────────────────────────────
-has_closed = not equity_df.empty
-
-if has_closed:
-    current_balance = float(equity_df["account_balance"].iloc[-1])
-    total_return    = (current_balance / STARTING_BALANCE - 1) * 100
-    n_closed        = len(equity_df)
-    n_wins          = int((equity_df["pnl_aud"] > 0).sum())
-    win_rate        = n_wins / n_closed * 100 if n_closed else 0.0
-else:
-    current_balance = STARTING_BALANCE
-    total_return    = 0.0
-    n_closed        = 0
-    win_rate        = 0.0
-
-bal_c = _colour(total_return)
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Account Balance",  f"${current_balance:,.0f}",
-          delta=f"{_fmt_aud(current_balance - STARTING_BALANCE)}" if has_closed else None)
-m2.metric("Total Return",     f"{total_return:+.2f}%",
-          delta=f"{total_return:+.2f}%" if has_closed else None)
-m3.metric("Closed Trades",    str(n_closed))
-m4.metric("Win Rate",         f"{win_rate:.0f}%" if has_closed else "—")
-
-# ── build Plotly figure ──────────────────────────────────────────────────────
-fig = go.Figure()
-
-# 1. Backtest equity curve — faded background line
-if not bt_equity.empty:
-    bt_start = float(bt_equity.iloc[0])
-    # Normalise backtest to same $20k starting balance
-    bt_normalised = bt_equity * (STARTING_BALANCE / bt_start)
-    fig.add_trace(go.Scatter(
-        x=bt_normalised.index,
-        y=bt_normalised.values,
-        mode="lines",
-        name="Backtest",
-        line=dict(color="rgba(100,100,120,0.35)", width=1.5, dash="solid"),
-        hovertemplate="Backtest: $%{y:,.0f}<br>%{x|%d %b %Y}<extra></extra>",
-    ))
-
-# 2. Horizontal dashed baseline at $20,000
-fig.add_hline(
-    y=STARTING_BALANCE,
-    line=dict(color="rgba(150,150,150,0.5)", width=1, dash="dash"),
-    annotation_text="$20,000 start",
-    annotation_position="bottom right",
-    annotation_font=dict(color="#555555", size=11),
-)
-
-# 3. Live equity line + trade dots
-if has_closed:
-    # Prepend the starting point so line starts at $20k
-    live_dates    = [equity_df["date"].iloc[0]] + equity_df["date"].tolist()
-    live_balances = [STARTING_BALANCE] + equity_df["account_balance"].tolist()
-
-    fig.add_trace(go.Scatter(
-        x=live_dates,
-        y=live_balances,
-        mode="lines",
-        name="Live account",
-        line=dict(color=GREEN, width=2),
-        hovertemplate="Live: $%{y:,.0f}<br>%{x|%d %b %Y}<extra></extra>",
-    ))
-
-    # Trade dots — green winners, red losers
-    winners = equity_df[equity_df["pnl_aud"] > 0]
-    losers  = equity_df[equity_df["pnl_aud"] <= 0]
-
-    for subset, colour, label in [
-        (winners, GREEN, "Win"),
-        (losers,  RED,   "Loss"),
-    ]:
-        if not subset.empty:
-            fig.add_trace(go.Scatter(
-                x=subset["date"],
-                y=subset["account_balance"],
-                mode="markers",
-                name=label,
-                marker=dict(color=colour, size=9, line=dict(color="#0d0d0d", width=1.5)),
-                customdata=subset[["ticker", "pnl_aud", "exit_type"]].values,
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b>  %{customdata[2]}<br>"
-                    "P&L: $%{customdata[1]:,.2f}<br>"
-                    "Balance: $%{y:,.0f}<br>"
-                    "%{x|%d %b %Y}<extra></extra>"
-                ),
-            ))
-else:
-    # No closed trades yet — flat line at $20k
-    from datetime import timedelta
-    today = datetime.now().date()
-    flat_dates = [today, today + timedelta(days=30)]
-    fig.add_trace(go.Scatter(
-        x=flat_dates,
-        y=[STARTING_BALANCE, STARTING_BALANCE],
-        mode="lines",
-        name="Live account",
-        line=dict(color=GREEN, width=2),
-        hoverinfo="skip",
-    ))
-    fig.add_annotation(
-        x=flat_dates[0], y=STARTING_BALANCE,
-        text="Waiting for first closed trade",
-        showarrow=False,
-        font=dict(color="#555555", size=12),
-        xanchor="left",
-        yanchor="bottom",
-        yshift=12,
-    )
-
-# ── layout ───────────────────────────────────────────────────────────────────
-fig.update_layout(
-    height=380,
-    paper_bgcolor="#0d0d0d",
-    plot_bgcolor="#0d0d0d",
-    font=dict(color="#888888", size=11),
-    legend=dict(
-        orientation="h",
-        yanchor="bottom", y=1.01,
-        xanchor="left",   x=0,
-        font=dict(size=11),
-        bgcolor="rgba(0,0,0,0)",
-    ),
-    margin=dict(l=60, r=20, t=10, b=40),
-    xaxis=dict(
-        gridcolor="#1e1e1e",
-        linecolor="#2a2a2a",
-        tickformat="%d %b %Y",
-        showgrid=True,
-    ),
-    yaxis=dict(
-        gridcolor="#1e1e1e",
-        linecolor="#2a2a2a",
-        tickprefix="$",
-        tickformat=",.0f",
-        showgrid=True,
-    ),
-    hovermode="x unified",
-)
-
-st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-st.markdown("---")
-
-# ---------------------------------------------------------------------------
-# 4. Performance summary
-# ---------------------------------------------------------------------------
-st.markdown("## Performance")
-
-if trades_raw.empty:
-    st.info("No trade data yet.")
-else:
-    df = trades_raw.copy().sort_values("timestamp").drop_duplicates("order_ref", keep="last")
-    n_trades   = len(df)
-    n_paper    = int(df["paper"].sum()) if "paper" in df.columns else n_trades
-    total_risk = df["risk_aud"].sum()
-    avg_score  = df["composite_score"].mean()
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Positions open/logged", n_trades)
-    m2.metric("Paper trades", n_paper)
-    m3.metric("Total risk deployed", f"${total_risk:,.0f}")
-    m4.metric("Avg signal score", f"{avg_score:.1f}")
-
-st.markdown("---")
-
-# ---------------------------------------------------------------------------
-# 5. Top screener stocks
-# ---------------------------------------------------------------------------
-st.markdown("## Top Screener Stocks")
-
-screener = _load_screener()
-
-if screener.empty:
-    st.info("No screener data found. Run python screener.py first.")
-else:
-    top10 = screener.head(10).copy()
-
-    rows_scr = ""
-    for _, r in top10.iterrows():
-        score_c = "#26a69a" if r["composite_score"] >= 70 else (
-                  "#f5a623" if r["composite_score"] >= 50 else "#ef5350")
-        rs_c  = _colour(r["rs_vs_xjo"])
-        mom_c = _colour(r["momentum_20d"])
-        rows_scr += f"""
-        <tr style="border-bottom:1px solid #1e1e1e">
-          <td style="padding:8px 10px;color:#555">{int(r['rank'])}</td>
-          <td style="padding:8px 10px;font-weight:700;color:#e0e0e0">{r['ticker'].replace('.AX','')}</td>
-          <td style="padding:8px 10px;text-align:right">${r['last_price']:.2f}</td>
-          <td style="padding:8px 10px;text-align:right">{r['market_cap_m']:,.0f}M</td>
-          <td style="padding:8px 10px;text-align:center;font-weight:700;color:{score_c}">{r['composite_score']:.1f}</td>
-          <td style="padding:8px 10px;text-align:right;color:{rs_c}">{r['rs_vs_xjo']:+.1f}%</td>
-          <td style="padding:8px 10px;text-align:right;color:{mom_c}">{r['momentum_20d']:+.1f}%</td>
-          <td style="padding:8px 10px;text-align:right;color:#888">{r['atr_pct']:.1f}%</td>
-          <td style="padding:8px 10px;text-align:right;color:#888">{r['vol_ratio']:.2f}x</td>
-          <td style="padding:8px 10px;text-align:right;color:#888">{r['rsi_14']:.0f}</td>
-        </tr>"""
-
-    scr_date = ""
-    if SCREENER_CSV.exists():
-        mtime = datetime.fromtimestamp(SCREENER_CSV.stat().st_mtime)
-        scr_date = f" &nbsp;·&nbsp; last run {mtime.strftime('%a %d %b %H:%M')}"
-
-    st.markdown(f"""
-    <p style="color:#555;font-size:12px;margin:0 0 8px">{len(screener)} stocks passed all filters{scr_date}</p>
-    <table style="width:100%;border-collapse:collapse;font-size:13px;background:#111111;border-radius:8px;overflow:hidden">
-      <thead>
-        <tr style="background:#1e1e1e;color:#666;font-size:11px;text-transform:uppercase;letter-spacing:0.05em">
-          <th style="padding:10px;text-align:left">#</th>
-          <th style="padding:10px;text-align:left">Ticker</th>
-          <th style="padding:10px;text-align:right">Price</th>
-          <th style="padding:10px;text-align:right">Mkt Cap</th>
-          <th style="padding:10px;text-align:center">Score</th>
-          <th style="padding:10px;text-align:right">RS vs XJO</th>
-          <th style="padding:10px;text-align:right">Mom 20d</th>
-          <th style="padding:10px;text-align:right">ATR%</th>
-          <th style="padding:10px;text-align:right">Vol Ratio</th>
-          <th style="padding:10px;text-align:right">RSI</th>
-        </tr>
-      </thead>
-      <tbody>{rows_scr}</tbody>
-    </table>
-    """, unsafe_allow_html=True)
-
-# ---------------------------------------------------------------------------
-# Footer
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# HEAT OVER TIME
+# ===========================================================================
+st.markdown("## 🌡️ Portfolio Heat Over Time")
 st.markdown(
-    "<p style='color:#333;font-size:11px;text-align:center;margin-top:36px'>"
-    "ASX Swing Engine &nbsp;·&nbsp; paper mode &nbsp;·&nbsp; "
-    "not financial advice &nbsp;·&nbsp; data: Yahoo Finance"
-    "</p>",
+    "<span style='color:#888;font-size:12px;'>Daily open risk as % of account · "
+    f"budget = {HEAT_BUDGET}%</span>",
     unsafe_allow_html=True,
 )
+if not heat_ts.empty:
+    st.plotly_chart(_chart_heat_over_time(heat_ts),
+                    use_container_width=True, config={"displayModeBar": False})
+else:
+    st.info("Heat history will build as trades are entered and exited.", icon="📊")
+
+# ===========================================================================
+# TRADE QUALITY BUCKETS
+# ===========================================================================
+st.markdown("## 🪣 Trade Quality Buckets")
+st.markdown(
+    "<span style='color:#888;font-size:12px;'>"
+    "F-pass/C-pass = normal trades · F-pass/C-block = CHOPPY_BEAR momentum-gated trades · "
+    "validates that Variant F's selective filter outperforms Variant C's hard block</span>",
+    unsafe_allow_html=True,
+)
+
+if quality:
+    bkt_rows = []
+    for bkt, stats in quality.items():
+        ar    = stats["avg_r"]
+        pnl   = stats["pnl_aud"]
+        bkt_rows.append({
+            "Bucket":    bkt,
+            "Trades":    stats["trades"],
+            "Win %":     f"{stats['win_rate']:.1f}%",
+            "Avg R":     f"{ar:.3f}" if not _safe_nan(ar) else "—",
+            "Total P&L": f"${pnl:+,.0f}" if not _safe_nan(pnl) else "—",
+        })
+    bkt_df = pd.DataFrame(bkt_rows)
+
+    def _style_bucket(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        colours = {
+            "F-pass / C-pass":  GREEN,
+            "F-pass / C-block": AMBER,
+            "Both block":       RED,
+        }
+        for i, row in df.iterrows():
+            c = colours.get(row["Bucket"], GREY)
+            styles.loc[i, "Bucket"] = f"color: {c}; font-weight: 600"
+        return styles
+
+    st.dataframe(
+        bkt_df.style.apply(_style_bucket, axis=None),
+        use_container_width=True, hide_index=True,
+    )
+    if not merged.empty and "f_regime" not in merged.columns and "regime" not in merged.columns:
+        st.caption("⚠️ Regime column not found in trade log — bucket classification unavailable until regime data is stored at entry.")
+else:
+    st.info(
+        "Bucket data builds as live trades close. Requires regime column in trade records.",
+        icon="🪣",
+    )
+
+# ===========================================================================
+# ROLLING EXPECTANCY CHART
+# ===========================================================================
+st.markdown("## 📈 Rolling Expectancy")
+st.markdown(
+    "<span style='color:#888;font-size:12px;'>"
+    "Rolling avg R over 10 / 30 / 50 trades · "
+    "converging toward BT baseline indicates system is behaving as expected</span>",
+    unsafe_allow_html=True,
+)
+
+if roll_exp:
+    st.plotly_chart(_chart_rolling_expectancy(roll_exp, n_closed),
+                    use_container_width=True, config={"displayModeBar": False})
+    if n_closed < DATA_COLLECTION_TRADES:
+        st.markdown(
+            '<div class="low-conf-note">⚠️ Rolling-10 line shown with reduced opacity — '
+            f'low confidence until trade {DATA_COLLECTION_TRADES} '
+            f'(currently {n_closed})</div>',
+            unsafe_allow_html=True,
+        )
+    _phase_note()
+else:
+    st.info(
+        f"Rolling expectancy requires at least 10 closed trades "
+        f"(currently {n_closed}).",
+        icon="📈",
+    )
+
+# ===========================================================================
+# BACKTEST vs LIVE COMPARISON PANEL
+# ===========================================================================
+st.markdown("## 📐 Backtest vs Live Comparison")
+st.markdown(
+    "<span style='color:#888;font-size:12px;'>"
+    f"🟡 Amber = 15–30% drift from Variant F baseline · "
+    f"🔴 Red = >30% drift (investigate)</span>",
+    unsafe_allow_html=True,
+)
+
+
+def _drift_row(metric_name, bt_val, live_val, fmt_fn, lower_is_better=False):
+    if _safe_nan(live_val):
+        return {
+            "Metric": metric_name,
+            "Backtest (Variant F)": fmt_fn(bt_val),
+            "Live (actual)": "—",
+            "Delta": "—",
+            "Status": "—",
+        }
+    live_str = fmt_fn(live_val)
+    if bt_val != 0:
+        drift = (live_val - bt_val) / abs(bt_val)
+        if lower_is_better:
+            drift = -drift
+        if drift < -DRIFT_THRESHOLD:
+            status = "🔴 ALERT"
+        elif drift < -DRIFT_WARN:
+            status = "🟡 WATCH"
+        else:
+            status = "🟢 OK"
+        delta_str = f"{drift:+.0%}"
+    else:
+        delta_str = "—"
+        status    = "—"
+    return {
+        "Metric": metric_name,
+        "Backtest (Variant F)": fmt_fn(bt_val),
+        "Live (actual)": live_str,
+        "Delta": delta_str,
+        "Status": status,
+    }
+
+
+rows = [
+    _drift_row("Win Rate %",       BT["win_rate"],       roll30["win_rate"],       lambda v: f"{v:.1f}%"),
+    _drift_row("Avg R / Trade",    BT["avg_r"],          roll30["avg_r"],          lambda v: f"{v:.3f}R"),
+    _drift_row("Profit Factor",    BT["profit_factor"],  roll30["profit_factor"],  lambda v: f"{v:.2f}"),
+    _drift_row("Expectancy (AUD)", BT["expectancy"],     roll30["expectancy"],     lambda v: f"${v:.0f}"),
+    _drift_row("Gap Stop %",       BT["gap_stop_pct"],   gs["pct"],               lambda v: f"{v:.1f}%",
+               lower_is_better=True),
+    _drift_row("Avg Entry Slip %", 0.20, 0.0 if has_paper else None, lambda v: f"{v:.2f}%",
+               lower_is_better=True),
+    _drift_row("Max Consec. Loss", float(BT["max_consec_loss"]),
+               float(max_streak) if max_streak else np.nan,
+               lambda v: f"{int(v)}", lower_is_better=True),
+]
+
+comp_df = pd.DataFrame(rows)
+
+def _style_comp(df):
+    styles = pd.DataFrame("", index=df.index, columns=df.columns)
+    for i, row in df.iterrows():
+        s = row["Status"]
+        if "🔴" in str(s):
+            c = RED
+        elif "🟡" in str(s):
+            c = AMBER
+        elif "🟢" in str(s):
+            c = GREEN
+        else:
+            c = GREY
+        styles.loc[i, "Status"] = f"color: {c}; font-weight: 600"
+        styles.loc[i, "Delta"]  = f"color: {c}"
+    return styles
+
+st.dataframe(
+    comp_df.style.apply(_style_comp, axis=None),
+    use_container_width=True, hide_index=True,
+)
+_phase_note()
+
+# ===========================================================================
+# FULL TRADE LOG
+# ===========================================================================
+st.markdown("## 📋 Full Trade Log")
+
+if merged.empty and open_df.empty:
+    st.info("No trades recorded yet. Trades will appear here after the first live run.", icon="📭")
+else:
+    log_rows = []
+    sort_col = "exit_date" if "exit_date" in merged.columns else (merged.columns[0] if not merged.empty else None)
+
+    for _, row in (merged.sort_values(sort_col, ascending=False)
+                   if sort_col else merged).iterrows():
+        entry_dt  = pd.to_datetime(row.get("timestamp","")).strftime("%Y-%m-%d") if pd.notna(row.get("timestamp")) else "—"
+        exit_dt   = pd.to_datetime(row.get("exit_date","")).strftime("%Y-%m-%d")  if pd.notna(row.get("exit_date"))  else "—"
+        pnl_r     = row.get("pnl_r",   np.nan)
+        pnl_aud   = row.get("pnl_aud", np.nan)
+        regime_e  = row.get("f_regime", row.get("regime", "—"))
+        fill_px   = f"{row['entry']:.3f}" if "entry" in row and pd.notna(row.get("entry")) else "—"
+        log_rows.append({
+            "Date":      entry_dt,
+            "Exit":      exit_dt,
+            "Ticker":    row.get("ticker", "—"),
+            "Regime":    regime_e,
+            "Signal Px": "—",
+            "Fill Px":   fill_px,
+            "Slip %":    "0.00%" if has_paper else "N/A",
+            "Exit Type": row.get("exit_type", "—"),
+            "R Result":  f"{pnl_r:+.2f}R" if pd.notna(pnl_r) else "—",
+            "P&L":       f"${pnl_aud:+,.0f}" if pd.notna(pnl_aud) else "—",
+            "_status":   "CLOSED",
+        })
+
+    for _, row in open_df.iterrows():
+        entry_dt = pd.to_datetime(row.get("timestamp","")).strftime("%Y-%m-%d") if pd.notna(row.get("timestamp")) else "—"
+        fill_px  = f"{row['entry']:.3f}" if "entry" in row and pd.notna(row.get("entry")) else "—"
+        log_rows.append({
+            "Date":      entry_dt,
+            "Exit":      "—",
+            "Ticker":    row.get("ticker", "—"),
+            "Regime":    "—",
+            "Signal Px": "—",
+            "Fill Px":   fill_px,
+            "Slip %":    "0.00%" if has_paper else "N/A",
+            "Exit Type": "—",
+            "R Result":  "OPEN",
+            "P&L":       "—",
+            "_status":   "OPEN",
+        })
+
+    log_df = pd.DataFrame(log_rows)
+
+    def _style_log(row):
+        if row["_status"] == "OPEN":
+            return [f"color: {BLUE}"] * len(row)
+        r = row["R Result"]
+        if str(r).startswith("+"):
+            return [f"color: {GREEN}"] * len(row)
+        if str(r).startswith("-"):
+            return [f"color: {RED}"] * len(row)
+        return [""] * len(row)
+
+    display_df = log_df.drop(columns=["_status"])
+    st.dataframe(
+        display_df.style.apply(_style_log, axis=1),
+        use_container_width=True, hide_index=True,
+    )
+
+# ===========================================================================
+# PIPELINE STATUS FOOTER
+# ===========================================================================
+if last_run:
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown("**Pipeline Status** — last run", unsafe_allow_html=True)
+    step_cols  = st.columns(6)
+    step_names = ["regime", "screener", "signals", "risk", "ibkr", "exit_logger"]
+    step_labels= ["Regime", "Screener", "Signals", "Risk", "IBKR", "Exit Logger"]
+    icons      = {"ok": "✅", "warn": "⚠️", "error": "❌", "skip": "⏭️", None: "⬜"}
+    for col, name, label in zip(step_cols, step_names, step_labels):
+        status = last_run.get("steps", {}).get(name)
+        col.markdown(
+            f"{icons.get(status,'⬜')} **{label}**<br/>"
+            f"<span style='color:#888;font-size:11px;'>{status or 'not run'}</span>",
+            unsafe_allow_html=True,
+        )
+
+# ===========================================================================
+# AUTO-REFRESH
+# ===========================================================================
+refresh_placeholder.markdown(
+    f"<div style='text-align:right;color:#555;font-size:11px;margin-top:20px;'>"
+    f"↻ auto-refresh {REFRESH_SECS//60}min</div>",
+    unsafe_allow_html=True,
+)
+time.sleep(REFRESH_SECS)
+st.rerun()
