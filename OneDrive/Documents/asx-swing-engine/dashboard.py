@@ -28,6 +28,11 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Page config  (must be first Streamlit call)
@@ -126,6 +131,143 @@ st.markdown("""
 
   /* hide streamlit chrome */
   #MainMenu, footer, header { visibility: hidden; }
+
+  /* ── Mobile-first responsive ───────────────────────────────── */
+  @media (max-width: 768px) {
+    /* tighter page padding on mobile */
+    .block-container { padding: 0.5rem !important; }
+
+    /* columns: allow wrapping, minimum 45% so 2-per-row */
+    div[data-testid="column"] { min-width: 45% !important; flex: 1 1 45% !important; }
+
+    /* larger base text for readability */
+    .stApp, p, div, span, li { font-size: 16px !important; }
+
+    /* section headers bigger on mobile */
+    h2 { font-size: 18px !important; }
+
+    /* metric tiles: larger numbers on small screen */
+    [data-testid="stMetricValue"] { font-size: 26px !important; }
+    [data-testid="stMetricLabel"] { font-size: 13px !important; }
+
+    /* snap bar: stack cells vertically on mobile */
+    .snap-bar { flex-direction: column !important; }
+    .snap-cell {
+      border-right: none !important;
+      border-bottom: 1px solid #1c1c1c !important;
+      padding: 16px 18px !important;
+    }
+    .snap-cell:last-child { border-bottom: none !important; }
+    .snap-value { font-size: 28px !important; }
+    .snap-label { font-size: 11px !important; }
+    .regime-badge { font-size: 18px !important; padding: 8px 18px !important; }
+
+    /* kill conditions: full width, large text, impossible to miss */
+    .kill-banner { padding: 20px 16px !important; }
+    .kill-banner-title { font-size: 20px !important; }
+    .kill-item { font-size: 16px !important; }
+    .snap-kill-pill { font-size: 18px !important; padding: 10px 16px !important; }
+
+    /* charts: ensure full width, no overflow */
+    [data-testid="stPlotlyChart"] { width: 100% !important; }
+
+    /* dataframes: horizontal scroll on mobile */
+    [data-testid="stDataFrame"] {
+      overflow-x: auto !important;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* cooldown / soft breach alerts: larger on mobile */
+    .mobile-alert { font-size: 16px !important; padding: 16px !important; }
+  }
+
+  @media (min-width: 769px) {
+    /* desktop: columns don't wrap */
+    div[data-testid="column"] { min-width: 0 !important; }
+  }
+
+  /* ── Snapshot bar ─────────────────────────────────────── */
+  .snap-bar {
+    display: flex;
+    background: #111111;
+    border: 1px solid #252525;
+    border-radius: 10px;
+    margin-bottom: 18px;
+    overflow: hidden;
+  }
+  .snap-cell {
+    flex: 1;
+    padding: 14px 22px;
+    border-right: 1px solid #1c1c1c;
+    min-width: 0;
+  }
+  .snap-cell:last-child { border-right: none; flex: 1.6; }
+  .snap-label {
+    color: #555;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+    font-weight: 600;
+  }
+  .snap-value {
+    font-size: 24px;
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    white-space: nowrap;
+  }
+  .snap-sub {
+    font-size: 11px;
+    color: #555;
+    margin-top: 4px;
+  }
+  .regime-badge {
+    display: inline-block;
+    padding: 5px 14px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    margin-top: 1px;
+  }
+  /* Kill conditions details/summary */
+  .snap-cell details { width: 100%; }
+  .snap-cell details summary {
+    cursor: pointer;
+    list-style: none;
+    outline: none;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+  .snap-cell details summary::-webkit-details-marker { display: none; }
+  .snap-kill-pill {
+    display: block;
+    padding: 7px 12px;
+    border-radius: 6px;
+    font-size: 15px;
+    font-weight: 700;
+    text-align: center;
+    letter-spacing: 0.02em;
+  }
+  .snap-kill-detail {
+    margin-top: 8px;
+    background: #0a0a0a;
+    border: 1px solid #252525;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 11px;
+    line-height: 1.6;
+    position: relative;
+    z-index: 10;
+  }
+  .snap-kill-item {
+    color: #ffcdd2;
+    padding: 3px 0 3px 8px;
+    border-left: 2px solid #ef5350;
+    margin-bottom: 5px;
+  }
+  .snap-kill-clear { color: #26a69a; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -302,6 +444,60 @@ def _load_signals() -> pd.DataFrame:
         return pd.read_csv(SIGNALS_CSV)
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=60)
+def _fetch_live_prices(tickers: tuple) -> dict:
+    """Latest prices for open positions — yfinance, 60-second cache."""
+    if not tickers or not _YF_AVAILABLE:
+        return {}
+    try:
+        data = yf.download(list(tickers), period="1d", progress=False, auto_adjust=True)
+        if data.empty:
+            return {}
+        close = data["Close"] if "Close" in data.columns else data
+        if hasattr(close, "columns"):
+            out = {}
+            for t in tickers:
+                if t in close.columns:
+                    s = close[t].dropna()
+                    if not s.empty:
+                        out[t] = float(s.iloc[-1])
+            return out
+        elif len(tickers) == 1:
+            s = close.dropna()
+            if len(s) > 0:
+                return {tickers[0]: float(s.iloc[-1])}
+        return {}
+    except Exception:
+        return {}
+
+
+def _calc_live_pnl(
+    open_df: pd.DataFrame,
+    equity_df: pd.DataFrame,
+    live_prices: dict,
+) -> tuple:
+    """
+    Total P&L = realised (closed trades) + unrealised (open positions at live prices).
+    Returns (total_pnl_aud, total_pnl_pct).
+    """
+    realised = float(equity_df["pnl_aud"].sum()) if (
+        not equity_df.empty and "pnl_aud" in equity_df.columns) else 0.0
+
+    unrealised = 0.0
+    if not open_df.empty:
+        for _, row in open_df.iterrows():
+            ticker = str(row.get("ticker", ""))
+            price  = live_prices.get(ticker, 0.0)
+            entry  = float(row.get("entry", 0.0))
+            shares = int(row.get("shares", 0))
+            if price > 0 and shares > 0:
+                unrealised += (price - entry) * shares
+
+    total_pnl = round(realised + unrealised, 2)
+    total_pct = round(total_pnl / STARTING_BALANCE * 100, 2) if STARTING_BALANCE > 0 else 0.0
+    return total_pnl, total_pct
 
 
 @st.cache_data(ttl=REFRESH_SECS)
@@ -1340,103 +1536,166 @@ cooldown_state  = _load_cooldown_state()
 soft_breach     = _update_soft_breach_state(roll30, gs, n_closed)
 
 # ---------------------------------------------------------------------------
-# Header
+# ── SNAPSHOT BAR ─────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
+
+# ── Live price fetch (60-second cache) ──────────────────────────────────
+_open_tickers  = tuple(open_df["ticker"].tolist()) if not open_df.empty else ()
+_live_prices   = _fetch_live_prices(_open_tickers)
+_live_pnl, _live_pct = _calc_live_pnl(open_df, equity_df, _live_prices)
+
+# ── Regime cell ─────────────────────────────────────────────────────────
 f_regime   = regime.get("f_regime", "STRONG_BULL")
 regime_mlt = regime.get("f_regime_size_multiplier", 1.0)
-ts_str     = (regime.get("timestamp", "")[:16] or "—")
 
-hcol1, hcol2, hcol3 = st.columns([3, 1, 1])
-with hcol1:
-    st.markdown(
-        f"## ASX Swing Engine &nbsp;·&nbsp; "
-        f"{_regime_pill(f_regime)} &nbsp; "
-        f"<span style='color:#888;font-size:13px;'>size ×{regime_mlt:.1f} · "
-        f"updated {ts_str}</span>",
-        unsafe_allow_html=True,
+_REGIME_STYLE = {
+    "STRONG_BULL": ("#0d2b1e", "#26a69a"),
+    "WEAK_BULL":   ("#2b1e0d", "#f5a623"),
+    "CHOPPY_BEAR": ("#2b1500", "#ff7043"),
+    "BEAR":        ("#2b0d0d", "#ef5350"),
+    "HIGH_VOL":    ("#1a0d2b", "#b39ddb"),
+}
+_r_bg, _r_col = _REGIME_STYLE.get(f_regime, ("#1a1a1a", "#888888"))
+_regime_html = (
+    f'<div class="snap-cell">'
+    f'  <div class="snap-label">REGIME</div>'
+    f'  <span class="regime-badge" style="background:{_r_bg};color:{_r_col};">'
+    f'    {f_regime.replace("_", " ")}'
+    f'  </span>'
+    f'  <div class="snap-sub">size ×{regime_mlt:.1f}</div>'
+    f'</div>'
+)
+
+# ── Last run cell ────────────────────────────────────────────────────────
+_run_date = last_run.get("run_date")
+_run_today = (_run_date == date.today()) if _run_date else False
+_run_col  = GREEN if _run_today else (RED if _run_date else GREY)
+_run_time = last_run.get("run_time", "—")
+_run_ok   = "✓" if last_run.get("complete") else ("⚠" if last_run else "—")
+_run_date_str = _run_date.strftime("%d %b") if hasattr(_run_date, "strftime") else str(_run_date or "—")
+_lastrun_html = (
+    f'<div class="snap-cell">'
+    f'  <div class="snap-label">LAST RUN</div>'
+    f'  <div class="snap-value" style="color:{_run_col};font-size:20px;">{_run_time} {_run_ok}</div>'
+    f'  <div class="snap-sub">{_run_date_str}</div>'
+    f'</div>'
+)
+
+# ── P&L cell ─────────────────────────────────────────────────────────────
+_pnl_col  = GREEN if _live_pnl >= 0 else RED
+_pnl_sign = "+" if _live_pnl >= 0 else ""
+_pct_sign = "+" if _live_pct >= 0 else ""
+_has_live = bool(_live_prices) and not open_df.empty
+_pnl_sub  = f'{_pct_sign}{_live_pct:.2f}%' + (' · live' if _has_live else ' · entry')
+_pnl_html = (
+    f'<div class="snap-cell">'
+    f'  <div class="snap-label">PORTFOLIO P&L</div>'
+    f'  <div class="snap-value" style="color:{_pnl_col};">'
+    f'    {_pnl_sign}${abs(_live_pnl):,.0f}'
+    f'  </div>'
+    f'  <div class="snap-sub" style="color:{_pnl_col};">{_pnl_sub}</div>'
+    f'</div>'
+)
+
+# ── Heat cell ─────────────────────────────────────────────────────────────
+_heat_ratio = heat_pct / HEAT_BUDGET if HEAT_BUDGET > 0 else 0
+_heat_col   = RED if _heat_ratio >= 0.8 else AMBER if _heat_ratio >= 0.6 else GREEN
+_heat_html  = (
+    f'<div class="snap-cell">'
+    f'  <div class="snap-label">HEAT</div>'
+    f'  <div class="snap-value" style="color:{_heat_col};">{heat_pct:.1f}%</div>'
+    f'  <div class="snap-sub">of {HEAT_BUDGET:.0f}% budget</div>'
+    f'</div>'
+)
+
+# ── Positions cell ────────────────────────────────────────────────────────
+_pos_col  = RED if n_open >= MAX_POSITIONS else AMBER if n_open >= int(MAX_POSITIONS * 0.67) else GREEN
+_pos_html = (
+    f'<div class="snap-cell">'
+    f'  <div class="snap-label">POSITIONS</div>'
+    f'  <div class="snap-value" style="color:{_pos_col};">{n_open}<span style="color:#333;font-size:16px;">/{MAX_POSITIONS}</span></div>'
+    f'  <div class="snap-sub">slots used</div>'
+    f'</div>'
+)
+
+# ── Kill conditions cell ──────────────────────────────────────────────────
+_has_kill   = bool(kill_conditions)
+_kpill_bg   = "#2b0d0d" if _has_kill else "#0d2b1e"
+_kpill_col  = RED       if _has_kill else GREEN
+_kpill_bdr  = "#ef535044" if _has_kill else "#26a69a44"
+_kpill_txt  = f"🛑 {len(kill_conditions)} TRIGGERED" if _has_kill else "✅ ALL CLEAR"
+
+# Build kill detail content for the <details> expand
+if _has_kill:
+    _kill_items_html = "".join(
+        f'<div class="snap-kill-item">⛔ {c}</div>' for c in kill_conditions
     )
-with hcol2:
-    run_status = ("✅ complete" if last_run.get("complete")
-                  else "⚠️ partial" if last_run else "—")
-    st.markdown(
-        f"<div style='text-align:right;color:#888;font-size:12px;margin-top:18px;'>"
-        f"Last run {last_run.get('run_date','—')} {last_run.get('run_time','')}"
-        f"<br/>{run_status}</div>",
-        unsafe_allow_html=True,
+    _kill_detail_html = f'<div class="snap-kill-detail">{_kill_items_html}</div>'
+elif n_closed < DATA_COLLECTION_TRADES:
+    _kill_detail_html = (
+        f'<div class="snap-kill-detail snap-kill-clear">'
+        f'Data collection phase — {n_closed}/{DATA_COLLECTION_TRADES} trades. '
+        f'Kill conditions activate after trade {DATA_COLLECTION_TRADES}.</div>'
     )
-with hcol3:
-    refresh_placeholder = st.empty()
+else:
+    _kill_detail_html = (
+        f'<div class="snap-kill-detail snap-kill-clear">'
+        f'All 5 conditions within parameters:<br>'
+        f'Expectancy · Profit factor · Gap stop rate · Entry slippage · Regime inversion'
+        f'</div>'
+    )
 
-st.markdown("<hr style='margin:4px 0 16px 0;'>", unsafe_allow_html=True)
+_kill_html = (
+    f'<div class="snap-cell">'
+    f'  <div class="snap-label">KILL CONDITIONS</div>'
+    f'  <details>'
+    f'    <summary>'
+    f'      <span class="snap-kill-pill" style="background:{_kpill_bg};color:{_kpill_col};border:1px solid {_kpill_bdr};">'
+    f'        {_kpill_txt}'
+    f'      </span>'
+    f'    </summary>'
+    f'    {_kill_detail_html}'
+    f'  </details>'
+    f'</div>'
+)
 
-# ===========================================================================
-# ⚠️  KILL CONDITIONS BANNER  — shown before everything else if triggered
-# ===========================================================================
+st.markdown(
+    f'<div class="snap-bar">{_regime_html}{_lastrun_html}{_pnl_html}{_heat_html}{_pos_html}{_kill_html}</div>',
+    unsafe_allow_html=True,
+)
+
+# ── Cool-down alert (operational — stays below bar) ─────────────────────
+refresh_placeholder = st.empty()
 
 _cd_active    = cooldown_state.get("active", False)
 _cd_remaining = cooldown_state.get("days_remaining", 0)
 _cd_elapsed   = cooldown_state.get("days_elapsed", 0)
 _cd_triggered = cooldown_state.get("triggered_date", "—")
-_cd_conditions= cooldown_state.get("conditions", kill_conditions)
 
-if kill_conditions or _cd_active:
-    # Use current conditions if fresh, otherwise show what triggered the cooldown
-    display_conditions = kill_conditions if kill_conditions else _cd_conditions
-    items_html = "".join(
-        f'<div class="kill-item">⛔ {cond}</div>' for cond in display_conditions
-    )
-
-    if _cd_remaining > 0:
-        cooldown_html = (
-            f'<div style="margin-top:12px;padding:10px 14px;background:#2b0505;'
-            f'border-radius:6px;border:1px solid #ef535055;">'
-            f'<span style="color:#ef5350;font-weight:700;font-size:14px;">'
-            f'⏳ COOL-DOWN: {_cd_remaining} trading day{"s" if _cd_remaining != 1 else ""} remaining</span>'
-            f'<span style="color:#888;font-size:12px;"> · triggered {_cd_triggered} · '
-            f'{_cd_elapsed}/{KILL_COOLDOWN_DAYS} days elapsed</span>'
-            f'<div style="color:#aaa;font-size:11px;margin-top:4px;">'
-            f'No new entries until cooldown expires. '
-            f'Manually delete <code>results/kill_cooldown.json</code> to override.</div>'
-            f'</div>'
-        )
-    elif _cd_active and _cd_remaining == 0:
-        cooldown_html = (
-            f'<div style="margin-top:12px;padding:8px 14px;background:#0d1a0d;'
-            f'border-radius:6px;border:1px solid #26a69a55;">'
-            f'<span style="color:#26a69a;font-weight:600;">✅ Cooldown period expired</span>'
-            f'<span style="color:#888;font-size:12px;"> · triggered {_cd_triggered} · '
-            f'resolve conditions above before resuming</span>'
-            f'</div>'
-        )
-    else:
-        cooldown_html = (
-            f'<div style="color:#888;font-size:11px;margin-top:10px;">'
-            f'Do not place new entries until conditions resolve. '
-            f'Cooldown ({KILL_COOLDOWN_DAYS} trading days) will start from today.</div>'
-        )
-
+if _cd_active and _cd_remaining > 0:
     st.markdown(
-        f"""<div class="kill-banner">
-          <div class="kill-banner-title">🛑 TRADING PAUSED — KILL CONDITIONS TRIGGERED</div>
-          {items_html}
-          {cooldown_html}
-        </div>""",
+        f'<div style="background:#1a0505;border:2px solid #ef5350;border-radius:8px;'
+        f'padding:12px 20px;margin-bottom:12px;">'
+        f'<span style="color:#ef5350;font-weight:700;font-size:14px;">'
+        f'⏳ COOL-DOWN: {_cd_remaining} trading day{"s" if _cd_remaining != 1 else ""} remaining</span>'
+        f'<span style="color:#888;font-size:12px;"> · triggered {_cd_triggered} · '
+        f'{_cd_elapsed}/{KILL_COOLDOWN_DAYS} days elapsed · '
+        f'delete <code>results/kill_cooldown.json</code> to override</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+elif _cd_active and _cd_remaining == 0:
+    st.markdown(
+        f'<div style="background:#0d1a0d;border:1px solid #26a69a55;border-radius:8px;'
+        f'padding:10px 18px;margin-bottom:12px;">'
+        f'<span style="color:#26a69a;font-weight:600;">✅ Cooldown expired</span>'
+        f'<span style="color:#888;font-size:12px;"> · triggered {_cd_triggered} · '
+        f'resolve kill conditions before resuming</span>'
+        f'</div>',
         unsafe_allow_html=True,
     )
 
-elif n_closed >= DATA_COLLECTION_TRADES:
-    st.markdown(
-        '<div class="kill-clear">✅ All kill conditions clear — system operating within parameters</div>',
-        unsafe_allow_html=True,
-    )
-else:
-    st.markdown(
-        f'<div class="phase-note" style="margin-bottom:14px;">'
-        f'ℹ️ Kill conditions inactive — data collection phase ({n_closed}/{DATA_COLLECTION_TRADES} trades)</div>',
-        unsafe_allow_html=True,
-    )
-
-# --- Soft breach warning (separate from kill — shown independently) ---
+# ── Soft breach warning ──────────────────────────────────────────────────
 _sb_days    = soft_breach.get("consecutive_days", 0)
 _sb_metrics = soft_breach.get("metrics", [])
 if _sb_days >= SOFT_BREACH_WARN_DAYS:
@@ -1456,7 +1715,7 @@ elif _sb_days > 0 and n_closed >= DATA_COLLECTION_TRADES:
     st.markdown(
         f'<div class="phase-note" style="margin-bottom:10px;">'
         f'🟡 {_sb_days} day{"s" if _sb_days != 1 else ""} in amber ({metrics_str}) — '
-        f'watch for {SOFT_BREACH_WARN_DAYS - _sb_days} more consecutive day{"s" if SOFT_BREACH_WARN_DAYS - _sb_days != 1 else ""} to trigger review</div>',
+        f'watch for {SOFT_BREACH_WARN_DAYS - _sb_days} more to trigger review</div>',
         unsafe_allow_html=True,
     )
 
@@ -1465,43 +1724,38 @@ elif _sb_days > 0 and n_closed >= DATA_COLLECTION_TRADES:
 # ===========================================================================
 st.markdown("## 📊 Portfolio Health")
 
-ph_left, ph_mid, ph_right = st.columns([5, 3, 2])
+# Equity curve + drawdown — full width so chart is readable on mobile
+st.markdown("**Equity Curve — Live vs Backtest**")
+st.plotly_chart(_chart_equity(live_eq, bt_eq),
+                use_container_width=True, config={"displayModeBar": False})
+st.plotly_chart(_chart_drawdown(live_eq),
+                use_container_width=True, config={"displayModeBar": False})
 
-with ph_left:
-    st.markdown("**Equity Curve — Live vs Backtest**")
-    st.plotly_chart(_chart_equity(live_eq, bt_eq),
-                    use_container_width=True, config={"displayModeBar": False})
-    st.plotly_chart(_chart_drawdown(live_eq),
-                    use_container_width=True, config={"displayModeBar": False})
+# Account + Exposure tiles — 4 across on desktop, 2 across on mobile (CSS handles wrap)
+st.markdown("**Account & Exposure**")
+ph_c1, ph_c2, ph_c3, ph_c4 = st.columns(4)
 
-with ph_mid:
-    st.markdown("**Account**")
-    _metric("Account Balance", f"${current_bal:,.0f}",
+with ph_c1:
+    _metric("Balance", f"${current_bal:,.0f}",
             delta=f"{total_pnl:+,.0f} ({total_ret:+.1f}%)",
             delta_colour=GREEN if total_pnl >= 0 else RED)
+with ph_c2:
     dd_clr = RED if current_dd < -3 else AMBER if current_dd < 0 else GREEN
-    _metric("Current Drawdown", f"{current_dd:.1f}%",
-            delta=f"Max {max_dd_live:.1f}% · BT max −{BT['max_dd']}%",
+    _metric("Drawdown", f"{current_dd:.1f}%",
+            delta=f"Max {max_dd_live:.1f}% · BT −{BT['max_dd']}%",
             delta_colour=dd_clr)
-    _metric("Closed Trades", str(n_closed))
-
-with ph_right:
-    st.markdown("**Exposure**")
+with ph_c3:
     heat_clr = RED if heat_pct > HEAT_BUDGET * 0.8 else AMBER if heat_pct > HEAT_BUDGET * 0.5 else GREEN
-    _metric("Open Positions", f"{n_open} / {MAX_POSITIONS}")
-    _metric("Exposure %",     f"{exposure_pct:.0f}%")
-    _metric("Heat %",         f"{heat_pct:.1f}%",
-            delta=f"Budget {HEAT_BUDGET}%", delta_colour=heat_clr)
-    # Capital at risk: worst-case if all stops hit tonight
+    _metric("Heat %", f"{heat_pct:.1f}%",
+            delta=f"{n_open}/{MAX_POSITIONS} slots · budget {HEAT_BUDGET}%",
+            delta_colour=heat_clr)
+with ph_c4:
     car_aud = cap_at_risk["max_loss_aud"]
     car_pct = cap_at_risk["max_loss_pct"]
     car_clr = RED if car_pct > 5 else AMBER if car_pct > 3 else GREEN
-    _metric(
-        "Capital at Risk Tomorrow",
-        f"−${car_aud:,.0f}",
-        delta=f"−{car_pct:.1f}% of account · if ALL stops hit",
-        delta_colour=car_clr,
-    )
+    _metric("Capital at Risk", f"−${car_aud:,.0f}",
+            delta=f"−{car_pct:.1f}% if ALL stops hit",
+            delta_colour=car_clr)
 
 # ── Open Positions (confirmed entry fills) ───────────────────────────────
 st.markdown(
@@ -1510,14 +1764,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 if not open_df.empty:
-    cols_show = [c for c in ["timestamp","ticker","shares","entry","stop_loss","target","risk_aud"]
-                 if c in open_df.columns]
-    disp = open_df[cols_show].copy()
+    disp = open_df.copy()
     if "timestamp" in disp.columns:
-        disp["timestamp"] = pd.to_datetime(disp["timestamp"]).dt.strftime("%Y-%m-%d")
+        disp["Date"] = pd.to_datetime(disp["timestamp"]).dt.strftime("%d %b")
     if "risk_aud" in disp.columns:
-        disp["risk_aud"] = disp["risk_aud"].map(lambda x: f"${x:.0f}")
-    st.dataframe(disp, use_container_width=True, hide_index=True)
+        disp["Risk"] = disp["risk_aud"].map(lambda x: f"${x:.0f}")
+    if "entry" in disp.columns:
+        disp["Entry"] = disp["entry"].map(lambda x: f"${x:.3f}")
+    if "stop_loss" in disp.columns:
+        disp["Stop"] = disp["stop_loss"].map(lambda x: f"${x:.3f}")
+    if "target" in disp.columns:
+        disp["Target"] = disp["target"].map(lambda x: f"${x:.3f}")
+    # Mobile-priority column order — most important first
+    mobile_cols = [c for c in ["ticker","Risk","Entry","Stop","Target","Date","shares"]
+                   if c in disp.columns]
+    st.dataframe(disp[mobile_cols].rename(columns={"ticker":"Ticker","shares":"Shares"}),
+                 use_container_width=True, hide_index=True)
 else:
     st.caption("No filled positions.")
 
@@ -1591,8 +1853,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-ev1, ev2, ev3, ev4, ev5, ev6, ev7 = st.columns(7)
-
 def _safe_pct(v, bt_v, lower_is_better=False):
     """Return delta colour based on live vs BT with amber/red thresholds."""
     if _safe_nan(v) or bt_v == 0:
@@ -1602,6 +1862,8 @@ def _safe_pct(v, bt_v, lower_is_better=False):
         drift = -drift
     return _drift_colour(drift)
 
+# Row 1: core edge metrics — 4 across desktop, 2 across mobile
+ev1, ev2, ev3, ev4 = st.columns(4)
 with ev1:
     wr  = roll30["win_rate"]
     _metric("Win Rate",       f"{wr:.1f}%" if not _safe_nan(wr) else "—",
@@ -1618,6 +1880,9 @@ with ev4:
     ar  = roll30["avg_r"]
     _metric("Avg R / Trade",  f"{ar:.3f}R" if not _safe_nan(ar) else "—",
             delta=f"BT {BT['avg_r']}R", delta_colour=_safe_pct(ar, BT["avg_r"]))
+
+# Row 2: execution quality — 3 across desktop, wraps to mobile
+ev5, ev6, ev7 = st.columns(3)
 with ev5:
     slip_str = "0.00%" if has_paper else "N/A"
     _metric("Avg Entry Slip", slip_str,
@@ -1628,7 +1893,6 @@ with ev6:
     placed = last_run.get("orders_placed") or 0
     _metric("Fill Rate (today)", f"{placed}/{sigs}" if sigs else "—",
             delta="signals → placed")
-
 with ev7:
     if exec_latency_s is not None:
         lat_clr = RED if exec_latency_s > 120 else AMBER if exec_latency_s > 60 else GREEN
@@ -1653,11 +1917,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-mt1, mt2, mt3, mt4, mt5 = st.columns(5)
-
+# Row 1: funnel counts — 4 across desktop, 2 across mobile
+mt1, mt2, mt3, mt4 = st.columns(4)
 with mt1:
     _metric("Signals Generated", str(missed["generated"]),
-            delta="RS + trigger scan (before regime filter)")
+            delta="RS + trigger scan")
 with mt2:
     _metric("Eligible After Filters", str(missed["eligible"]),
             delta="Passed regime / momentum gate")
@@ -1668,8 +1932,11 @@ with mt3:
             delta_colour=AMBER if blocked_by_regime > 0 else GREEN)
 with mt4:
     _metric("Executed", str(missed["executed"]),
-            delta="Orders placed (heat / sector / cap)",
+            delta="Orders placed",
             delta_colour=GREEN if missed["executed"] > 0 else GREY)
+
+# Row 2: missed summary — single tile
+mt5, mt5b = st.columns(2)
 with mt5:
     hypo_str = (f"+{missed['hypo_r']:.2f}R / ${missed['hypo_pnl']:+,.0f}"
                 if missed["missed"] > 0 else "—")
@@ -1713,11 +1980,12 @@ if total_breakdown > 0:
 # ===========================================================================
 st.markdown("## 🔬 System Diagnostics")
 
-sd1, sd2, sd3, sd4 = st.columns(4)
+# ── Regime Matrix + Losing Streak side by side on desktop, stacked on mobile
+sd1, sd2 = st.columns(2)
 
 with sd1:
     st.markdown("**Regime Performance Matrix**")
-    st.caption("Validates Variant F's core thesis: CHOPPY_BEAR underperforms STRONG_BULL")
+    st.caption("Validates Variant F: CHOPPY_BEAR should underperform STRONG_BULL")
     if not regime_matrix.empty:
         def _style_regime(df):
             styles = pd.DataFrame("", index=df.index, columns=df.columns)
@@ -1736,53 +2004,6 @@ with sd1:
         st.caption("No live trades yet — showing backtest regime distribution.")
 
 with sd2:
-    st.markdown("**Slippage Decomposition**")
-    entry_slip = "0.00%" if has_paper else "N/A"
-    _metric("Entry Slippage", entry_slip,
-            delta="Paper: signal px = fill px")
-
-    es = slip_decomp["exit_slip_r"]
-    _metric("Normal Stop Slip",
-            f"{es:+.3f}R" if not _safe_nan(es) else "—",
-            delta="deviation from −1R",
-            delta_colour=RED if (not _safe_nan(es) and es < -0.05) else GREEN)
-
-    ge = slip_decomp["gap_excess_r"]
-    _metric("Gap Excess Loss",
-            f"{ge:+.3f}R" if not _safe_nan(ge) else "—",
-            delta="gap stop avg vs −1R expected",
-            delta_colour=RED if (not _safe_nan(ge) and ge < -0.1) else AMBER)
-
-    ts_slip = slip_decomp["target_slip_r"]
-    _metric("Target Exit Slip",
-            f"{ts_slip:+.3f}R" if not _safe_nan(ts_slip) else "—",
-            delta="deviation from +2R",
-            delta_colour=RED if (not _safe_nan(ts_slip) and ts_slip < -0.1) else GREEN)
-
-with sd3:
-    st.markdown("**Trade Lifecycle**")
-    if not merged.empty:
-        if "holding_days" in merged.columns:
-            avg_hold = round(float(merged["holding_days"].mean()), 1)
-        elif "exit_date" in merged.columns and "timestamp" in merged.columns:
-            avg_hold = round(float(
-                (pd.to_datetime(merged["exit_date"]) - pd.to_datetime(merged["timestamp"]))
-                .dt.days.mean()
-            ), 1)
-        else:
-            avg_hold = np.nan
-        _metric("Avg Hold Days", f"{avg_hold:.1f}d" if not _safe_nan(avg_hold) else "—",
-                delta=f"BT {BT['avg_hold_days']}d")
-        exits_bd = _exit_type_breakdown(merged)
-        if exits_bd:
-            total_ex = sum(exits_bd.values())
-            bd_rows  = [{"Exit Type": k, "Count": v, "%": f"{v/total_ex*100:.0f}%"}
-                        for k, v in sorted(exits_bd.items(), key=lambda x: -x[1])]
-            st.dataframe(pd.DataFrame(bd_rows), use_container_width=True, hide_index=True)
-    else:
-        _metric("Avg Hold Days", "—")
-
-with sd4:
     st.markdown("**Losing Streak Tracker**")
     streak_clr = RED if cur_streak >= BT["max_consec_loss"] else AMBER if cur_streak >= 2 else GREEN
     _metric("Current Streak", f"{cur_streak} losses",
@@ -1802,6 +2023,44 @@ with sd4:
         layout_s["yaxis"] = dict(**PLOT_LAYOUT["yaxis"], ticksuffix="R")
         fig_str.update_layout(**layout_s)
         st.plotly_chart(fig_str, use_container_width=True, config={"displayModeBar": False})
+
+# ── Slippage + Trade Lifecycle — 4 tiles across, 2-per-row on mobile
+sd3a, sd3b, sd3c, sd3d = st.columns(4)
+
+with sd3a:
+    st.markdown("**Slippage**")
+    entry_slip = "0.00%" if has_paper else "N/A"
+    _metric("Entry Slip", entry_slip, delta="Paper: signal px = fill px")
+
+with sd3b:
+    es = slip_decomp["exit_slip_r"]
+    _metric("Stop Slip",
+            f"{es:+.3f}R" if not _safe_nan(es) else "—",
+            delta="deviation from −1R",
+            delta_colour=RED if (not _safe_nan(es) and es < -0.05) else GREEN)
+
+with sd3c:
+    ge = slip_decomp["gap_excess_r"]
+    _metric("Gap Excess",
+            f"{ge:+.3f}R" if not _safe_nan(ge) else "—",
+            delta="gap stop avg vs −1R",
+            delta_colour=RED if (not _safe_nan(ge) and ge < -0.1) else AMBER)
+
+with sd3d:
+    if not merged.empty:
+        if "holding_days" in merged.columns:
+            avg_hold = round(float(merged["holding_days"].mean()), 1)
+        elif "exit_date" in merged.columns and "timestamp" in merged.columns:
+            avg_hold = round(float(
+                (pd.to_datetime(merged["exit_date"]) - pd.to_datetime(merged["timestamp"]))
+                .dt.days.mean()
+            ), 1)
+        else:
+            avg_hold = np.nan
+        _metric("Avg Hold", f"{avg_hold:.1f}d" if not _safe_nan(avg_hold) else "—",
+                delta=f"BT {BT['avg_hold_days']}d")
+    else:
+        _metric("Avg Hold", "—")
 
 # ===========================================================================
 # HEAT OVER TIME
@@ -1999,16 +2258,16 @@ else:
         regime_e  = row.get("f_regime", row.get("regime", "—"))
         fill_px   = f"{row['entry']:.3f}" if "entry" in row and pd.notna(row.get("entry")) else "—"
         log_rows.append({
-            "Date":      entry_dt,
-            "Exit":      exit_dt,
+            # Mobile-priority columns first (shown even when table is narrow)
             "Ticker":    row.get("ticker", "—"),
-            "Regime":    regime_e,
-            "Signal Px": "—",
-            "Fill Px":   fill_px,
-            "Slip %":    "0.00%" if has_paper else "N/A",
-            "Exit Type": row.get("exit_type", "—"),
             "R Result":  f"{pnl_r:+.2f}R" if pd.notna(pnl_r) else "—",
+            "Exit Type": row.get("exit_type", "—"),
+            "Date":      entry_dt,
+            # Secondary columns (scroll right on mobile)
+            "Exit":      exit_dt,
             "P&L":       f"${pnl_aud:+,.0f}" if pd.notna(pnl_aud) else "—",
+            "Fill Px":   fill_px,
+            "Regime":    regime_e,
             "_status":   "CLOSED",
         })
 
@@ -2016,16 +2275,14 @@ else:
         entry_dt = pd.to_datetime(row.get("timestamp","")).strftime("%Y-%m-%d") if pd.notna(row.get("timestamp")) else "—"
         fill_px  = f"{row['entry']:.3f}" if "entry" in row and pd.notna(row.get("entry")) else "—"
         log_rows.append({
+            "Ticker":    row.get("ticker", "—"),
+            "R Result":  "OPEN",
+            "Exit Type": "—",
             "Date":      entry_dt,
             "Exit":      "—",
-            "Ticker":    row.get("ticker", "—"),
-            "Regime":    "—",
-            "Signal Px": "—",
-            "Fill Px":   fill_px,
-            "Slip %":    "0.00%" if has_paper else "N/A",
-            "Exit Type": "—",
-            "R Result":  "OPEN",
             "P&L":       "—",
+            "Fill Px":   fill_px,
+            "Regime":    "—",
             "_status":   "OPEN",
         })
 
