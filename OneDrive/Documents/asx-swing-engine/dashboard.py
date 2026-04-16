@@ -598,7 +598,8 @@ def _heat_over_time_series(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> 
         return pd.Series(dtype=float)
 
     entries = trades_df[["timestamp", "order_ref", "risk_aud"]].copy()
-    entries["entry_date"] = pd.to_datetime(entries["timestamp"]).dt.date
+    # Keep as Timestamps throughout — avoids dtype mismatch when exit_date is all-NaT
+    entries["entry_date"] = pd.to_datetime(entries["timestamp"])
 
     # Get exit dates from equity_df
     if not equity_df.empty and "order_ref" in equity_df.columns and "date" in equity_df.columns:
@@ -606,22 +607,21 @@ def _heat_over_time_series(trades_df: pd.DataFrame, equity_df: pd.DataFrame) -> 
     else:
         exit_map = {}
 
-    entries["exit_date"] = entries["order_ref"].map(exit_map)
-    entries["exit_date"] = pd.to_datetime(entries["exit_date"]).dt.date
+    entries["exit_date"] = pd.to_datetime(entries["order_ref"].map(exit_map))
 
     if entries["entry_date"].empty:
         return pd.Series(dtype=float)
 
     first_day = entries["entry_date"].min()
-    last_day  = date.today()
+    last_day  = pd.Timestamp(date.today())
     all_days  = pd.date_range(first_day, last_day, freq="B")  # business days
 
     heat_vals = []
     for day in all_days:
-        d = day.date()
+        # Compare Timestamps directly — no .date() conversion needed
         open_risk = entries[
-            (entries["entry_date"] <= d) &
-            (entries["exit_date"].isna() | (entries["exit_date"] >= d))
+            (entries["entry_date"] <= day) &
+            (entries["exit_date"].isna() | (entries["exit_date"] >= day))
         ]["risk_aud"].sum()
         heat_vals.append(open_risk / STARTING_BALANCE * 100)
 
@@ -2041,9 +2041,9 @@ else:
             return [f"color: {RED}"] * len(row)
         return [""] * len(row)
 
-    display_df = log_df.drop(columns=["_status"])
+    # Apply style on log_df (which contains _status), then hide _status column
     st.dataframe(
-        display_df.style.apply(_style_log, axis=1),
+        log_df.style.apply(_style_log, axis=1).hide(subset=["_status"], axis="columns"),
         use_container_width=True, hide_index=True,
     )
 
