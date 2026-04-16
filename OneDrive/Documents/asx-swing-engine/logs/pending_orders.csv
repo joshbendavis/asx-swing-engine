@@ -1,0 +1,2 @@
+timestamp,ticker,shares,entry,stop_loss,target,risk_per_share,risk_aud,order_ref,parent_id,tp_id,sl_id,trigger_count,composite_score,account,paper
+2026-04-07 18:39:05,KGN.AX,852,3.95,3.598,4.654,0.352,299.9,ASX-20260407-KGN,92,93,94,2,63.2,DUK913437,True
