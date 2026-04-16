@@ -452,7 +452,7 @@ def run_executor(signals_path: Path, dry_run: bool = False) -> int:
     headroom = MAX_POSITIONS - effective_open
 
     log.info(
-        "Position slots: %d filled + %d pending = %d effective / %d max  →  %d slot(s) free",
+        "Position slots: %d filled + %d pending = %d effective / %d max  ->  %d slot(s) free",
         open_positions, pending_count, effective_open, MAX_POSITIONS, max(0, headroom),
     )
 
