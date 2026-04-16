@@ -298,6 +298,8 @@ def send_daily_summary(pipeline_context: dict | None = None) -> bool:
     lines = [
         f"<b>📈 ASX Swing Engine — {run_date}</b>  <i>{run_time}</i>",
         "",
+        f"{pnl_icon} <b>P&L  {pnl_sign}${abs(live_pnl):,.0f}  ({pnl_sign}{pnl_pct:.2f}%)</b>",
+        "",
         f"<b>REGIME</b>  {r_emoji} <b>{regime.replace('_', ' ')}</b>"
         f"  ·  size ×{psm:.1f}  ·  conf {confidence}%",
         "",
@@ -313,9 +315,6 @@ def send_daily_summary(pipeline_context: dict | None = None) -> bool:
         pos_block,
         "",
         f"<b>HEAT</b>  {heat_icon} <b>{heat_pct:.1f}%</b> of {HEAT_BUDGET:.0f}% budget",
-        "",
-        f"<b>PORTFOLIO P&L</b>  {pnl_icon} <b>{pnl_sign}${abs(live_pnl):,.0f}</b>"
-        f"  ({pnl_sign}{pnl_pct:.2f}%)",
         "",
         f"<b>KILL CONDITIONS</b>  {kill_line}",
     ]

@@ -45,6 +45,31 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
+# Mobile detection — inject JS that sets ?view=mobile on narrow screens.
+# On re-render Streamlit reads the query param and routes to mobile view.
+# ---------------------------------------------------------------------------
+st.markdown("""
+<script>
+(function() {
+    try {
+        var w = window.innerWidth || document.documentElement.clientWidth || 768;
+        var url = new URL(window.location.href);
+        var cur = url.searchParams.get('view');
+        if (w < 768 && cur !== 'mobile') {
+            url.searchParams.set('view', 'mobile');
+            window.location.replace(url.toString());
+        } else if (w >= 768 && cur === 'mobile') {
+            url.searchParams.delete('view');
+            window.location.replace(url.toString());
+        }
+    } catch(e) {}
+})();
+</script>
+""", unsafe_allow_html=True)
+
+_is_mobile = st.query_params.get("view", "") == "mobile"
+
+# ---------------------------------------------------------------------------
 # Dark theme CSS
 # ---------------------------------------------------------------------------
 st.markdown("""
@@ -184,6 +209,61 @@ st.markdown("""
   @media (min-width: 769px) {
     /* desktop: columns don't wrap */
     div[data-testid="column"] { min-width: 0 !important; }
+  }
+
+  /* ── Mobile-only simplified view ──────────────────────────── */
+  .mobile-pnl {
+    font-size: 52px;
+    font-weight: bold;
+    text-align: center;
+    padding: 24px 16px 8px 16px;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+  }
+  .mobile-pnl-pct {
+    font-size: 22px;
+    font-weight: 600;
+    text-align: center;
+    padding-bottom: 24px;
+    opacity: 0.85;
+  }
+  .mobile-ticker {
+    font-size: 28px;
+    font-weight: bold;
+    line-height: 1.1;
+  }
+  .mobile-trade-pnl {
+    font-size: 22px;
+    font-weight: 600;
+  }
+  .mobile-trade-row {
+    padding: 16px 12px;
+    border-bottom: 1px solid #222;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .mob-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 14px;
+    background: #111;
+    border-bottom: 1px solid #222;
+    margin-bottom: 4px;
+  }
+  .mob-run-dot {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  .mob-section-title {
+    color: #555;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 16px 12px 6px 12px;
+    font-weight: 600;
   }
 
   /* ── Snapshot bar ─────────────────────────────────────── */
@@ -1534,6 +1614,127 @@ cooldown_state  = _load_cooldown_state()
 
 # --- Soft breach: update counter once per day, load current state ---
 soft_breach     = _update_soft_breach_state(roll30, gs, n_closed)
+
+# ---------------------------------------------------------------------------
+# ── MOBILE VIEW  (rendered when ?view=mobile, then st.stop())
+# ---------------------------------------------------------------------------
+if _is_mobile:
+    # Live prices for per-trade P&L
+    _mob_tickers  = tuple(open_df["ticker"].tolist()) if not open_df.empty else ()
+    _mob_prices   = _fetch_live_prices(_mob_tickers)
+    _mob_pnl, _mob_pct = _calc_live_pnl(open_df, equity_df, _mob_prices)
+
+    # Regime
+    _mob_regime   = regime.get("f_regime", "STRONG_BULL")
+    _mob_r_bg, _mob_r_col = {
+        "STRONG_BULL": ("#0d2b1e", "#26a69a"),
+        "WEAK_BULL":   ("#2b1e0d", "#f5a623"),
+        "CHOPPY_BEAR": ("#2b1500", "#ff7043"),
+        "BEAR":        ("#2b0d0d", "#ef5350"),
+        "HIGH_VOL":    ("#1a0d2b", "#b39ddb"),
+    }.get(_mob_regime, ("#1a1a1a", "#888"))
+
+    # Last run dot
+    _mob_run_date  = last_run.get("run_date")
+    _mob_ran_today = (_mob_run_date == date.today()) if _mob_run_date else False
+    _mob_dot_col   = "#26a69a" if _mob_ran_today else "#ef5350"
+    _mob_dot       = "●"
+    _mob_date_str  = (
+        _mob_run_date.strftime("%d %b") if hasattr(_mob_run_date, "strftime")
+        else str(_mob_run_date or "—")
+    )
+
+    # P&L colours
+    _mob_pnl_col  = "#26a69a" if _mob_pnl >= 0 else "#ef5350"
+    _mob_pnl_sign = "+" if _mob_pnl >= 0 else ""
+    _mob_pct_sign = "+" if _mob_pct >= 0 else ""
+
+    # ── Header strip ───────────────────────────────────────────────────────
+    st.markdown(
+        f'<div class="mob-header">'
+        f'  <span style="background:{_mob_r_bg};color:{_mob_r_col};padding:6px 14px;'
+        f'    border-radius:6px;font-size:15px;font-weight:800;letter-spacing:0.05em;">'
+        f'    {_mob_regime.replace("_", " ")}'
+        f'  </span>'
+        f'  <span class="mob-run-dot" style="color:{_mob_dot_col};">'
+        f'    {_mob_date_str} {_mob_dot}'
+        f'  </span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Total P&L ───────────────────────────────────────────────────────────
+    st.markdown(
+        f'<div class="mobile-pnl" style="color:{_mob_pnl_col};">'
+        f'  {_mob_pnl_sign}${abs(_mob_pnl):,.0f}'
+        f'</div>'
+        f'<div class="mobile-pnl-pct" style="color:{_mob_pnl_col};">'
+        f'  {_mob_pct_sign}{_mob_pct:.2f}%'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Open trades list ────────────────────────────────────────────────────
+    st.markdown('<div class="mob-section-title">OPEN POSITIONS</div>', unsafe_allow_html=True)
+
+    if open_df.empty:
+        st.markdown(
+            '<div style="color:#555;text-align:center;padding:24px;font-size:16px;">'
+            'No open positions</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        trade_rows_html = ""
+        for _, row in open_df.iterrows():
+            ticker = str(row.get("ticker", "?")).replace(".AX", "")
+            try:
+                entry  = float(row.get("entry", 0))
+                shares = int(row.get("shares", 0))
+            except (ValueError, TypeError):
+                entry = shares = 0
+
+            live_px = _mob_prices.get(str(row.get("ticker", "")), 0.0)
+            if live_px > 0 and shares > 0:
+                trade_unrl = (live_px - entry) * shares
+                arrow      = "↑" if trade_unrl >= 0 else "↓"
+                t_col      = "#26a69a" if trade_unrl >= 0 else "#ef5350"
+                t_sign     = "+" if trade_unrl >= 0 else ""
+                pnl_str    = f"{t_sign}${abs(trade_unrl):,.0f}"
+            else:
+                t_col   = "#555"
+                arrow   = "—"
+                pnl_str = "—"
+
+            trade_rows_html += (
+                f'<div class="mobile-trade-row">'
+                f'  <span class="mobile-ticker" style="color:#e0e0e0;">{ticker}</span>'
+                f'  <span style="display:flex;align-items:center;gap:10px;">'
+                f'    <span class="mobile-trade-pnl" style="color:{t_col};">{pnl_str}</span>'
+                f'    <span style="font-size:26px;color:{t_col};">{arrow}</span>'
+                f'  </span>'
+                f'</div>'
+            )
+
+        st.markdown(
+            f'<div style="background:#0d0d0d;border:1px solid #222;border-radius:10px;'
+            f'overflow:hidden;margin-top:4px;">{trade_rows_html}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Kill conditions — just a single line at the bottom if triggered
+    if kill_conditions:
+        st.markdown(
+            f'<div style="margin-top:20px;background:#1a0505;border:2px solid #ef5350;'
+            f'border-radius:8px;padding:16px;text-align:center;">'
+            f'<span style="color:#ef5350;font-size:20px;font-weight:700;">'
+            f'🛑 {len(kill_conditions)} KILL CONDITION{"S" if len(kill_conditions) != 1 else ""} TRIGGERED'
+            f'</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    # Auto-refresh then stop — don't render desktop view
+    time.sleep(REFRESH_SECS)
+    st.rerun()
 
 # ---------------------------------------------------------------------------
 # ── SNAPSHOT BAR ─────────────────────────────────────────────────────────
