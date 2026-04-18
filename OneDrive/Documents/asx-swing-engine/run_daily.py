@@ -8,6 +8,7 @@ Pipeline:
     1. Screener        -> results/screener_output.csv
     2. Signals         -> results/signals_output.csv
     3. Risk engine     -> results/signals_final.csv
+   3.5 Gap risk engine -> results/gap_risk_actions.json  (updates signals_final.csv)
     4. Charts          -> results/charts/YYYYMMDD/
     5. Email
     6. IBKR execution  <- reads signals_final.csv
@@ -28,6 +29,7 @@ Usage:
     python run_daily.py --no-ibkr                # skip order submission
     python run_daily.py --ibkr-dry-run           # print IBKR orders without submitting
     python run_daily.py --no-charts --no-email   # screener + signals only
+    python run_daily.py --no-gap-risk            # skip gap risk engine (Step 3.5)
 """
 
 import argparse
@@ -64,6 +66,7 @@ from regime_detector import run_regime_detector
 from screener import run_screener
 from signals import run_signals
 from risk_engine import run_risk_engine
+from gap_risk_engine import run as run_gap_risk
 from ibkr_executor import run_executor as ibkr_run
 from utils.charts import generate_charts
 from utils.emailer import send_email
@@ -78,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-email",         action="store_true", help="Skip sending email")
     p.add_argument("--no-signals",       action="store_true", help="Skip signal scanner")
     p.add_argument("--no-risk-engine",   action="store_true", help="Skip risk engine (use signals_output.csv directly)")
+    p.add_argument("--no-gap-risk",       action="store_true", help="Skip gap risk engine (Step 3.5)")
     p.add_argument("--no-ibkr",          action="store_true", help="Skip IBKR order submission")
     p.add_argument("--ibkr-dry-run",     action="store_true", help="IBKR dry-run: print orders, do not submit")
     p.add_argument("--no-exit-logger",   action="store_true", help="Skip launching exit_logger in background")
@@ -96,7 +100,7 @@ def main() -> None:
     _tg: dict = {
         "run_date": datetime.today().strftime("%Y-%m-%d"),
         "run_time": datetime.today().strftime("%H:%M"),
-        "steps":    {k: None for k in ["regime","screener","signals","risk","ibkr","exit_logger"]},
+        "steps":    {k: None for k in ["regime","screener","signals","risk","gap_risk","ibkr","exit_logger"]},
         "screener_n": None,
         "signals_n":  None,
         "orders_n":   None,
@@ -214,11 +218,49 @@ def main() -> None:
             _tg["steps"]["risk"] = "error"
             # Non-fatal — IBKR step will still run with whatever signals_final.csv contains
 
+    # ── 3.5 Gap Risk Engine ───────────────────────────────────────────────────
+    if args.no_gap_risk:
+        log.info("Step 3.5/8 - Gap risk engine skipped (--no-gap-risk).")
+    else:
+        log.info("Step 3.5/8 - Running gap risk engine ...")
+        try:
+            sig_path_gr  = Path("results") / "signals_final.csv"
+            trades_path  = Path("logs")    / "trades.csv"
+            regime_path  = Path("results") / "regime.json"
+            actions_path = Path("results") / "gap_risk_actions.json"
+            balance      = float(os.getenv("PAPER_BALANCE_OVERRIDE", "20000"))
+
+            if not sig_path_gr.exists():
+                log.warning(
+                    "Step 3.5/8 - signals_final.csv not found; gap risk engine skipped."
+                )
+                _tg["steps"]["gap_risk"] = "warn"
+            else:
+                ok = run_gap_risk(
+                    signals_path  = sig_path_gr,
+                    trades_path   = trades_path,
+                    regime_path   = regime_path,
+                    actions_path  = actions_path,
+                    balance       = balance,
+                )
+                if ok:
+                    log.info(
+                        "Gap risk engine complete -> actions written to %s", actions_path
+                    )
+                    _tg["steps"]["gap_risk"] = "ok"
+                else:
+                    log.warning("Gap risk engine ran but produced no actions.")
+                    _tg["steps"]["gap_risk"] = "warn"
+        except Exception as exc:
+            log.error("Gap risk engine failed: %s", exc, exc_info=True)
+            _tg["steps"]["gap_risk"] = "error"
+            # Non-fatal — IBKR still reads whatever signals_final.csv contains
+
     # ── 4. Charts ─────────────────────────────────────────────────────────────
     chart_paths: list[tuple[str, str]] = []
 
     if not args.no_charts:
-        log.info("Step 4/7 - Generating charts for top %d ...", args.top_n)
+        log.info("Step 4/8 - Generating charts for top %d ...", args.top_n)
         try:
             chart_paths = generate_charts(results, top_n=args.top_n)
             log.info("Generated %d chart(s).", len(chart_paths))
@@ -226,11 +268,11 @@ def main() -> None:
             log.error("Chart generation failed: %s", exc, exc_info=True)
             # Non-fatal - continue to email with no charts
     else:
-        log.info("Step 4/7 - Charts skipped (--no-charts).")
+        log.info("Step 4/8 - Charts skipped (--no-charts).")
 
     # ── 4. Email ──────────────────────────────────────────────────────────────
     if not args.no_email:
-        log.info("Step 5/7 - Sending email ...")
+        log.info("Step 5/8 - Sending email ...")
 
         email_from = os.getenv("EMAIL_FROM", "").strip()
         email_pass = os.getenv("EMAIL_PASSWORD", "").strip()
@@ -258,25 +300,25 @@ def main() -> None:
             except Exception as exc:
                 log.error("Email failed: %s", exc, exc_info=True)
     else:
-        log.info("Step 5/7 - Email skipped (--no-email).")
+        log.info("Step 5/8 - Email skipped (--no-email).")
 
     # ── 5. IBKR order submission ───────────────────────────────────────────────
     if args.no_ibkr:
-        log.info("Step 6/7 - IBKR skipped (--no-ibkr).")
+        log.info("Step 6/8 - IBKR skipped (--no-ibkr).")
     else:
         # Prefer risk-engine output; fall back to raw signals if risk engine was skipped
         sig_path = Path("results") / "signals_final.csv"
         if not sig_path.exists():
             sig_path = Path("results") / "signals_output.csv"
             log.warning(
-                "Step 6/7 - signals_final.csv not found, falling back to signals_output.csv."
+                "Step 6/8 - signals_final.csv not found, falling back to signals_output.csv."
             )
         if not sig_path.exists():
-            log.warning("Step 6/7 - no signals file found, skipping IBKR.")
+            log.warning("Step 6/8 - no signals file found, skipping IBKR.")
         else:
             dry = args.ibkr_dry_run
             mode_label = "DRY-RUN" if dry else "LIVE SUBMIT"
-            log.info("Step 6/7 - IBKR order submission [%s] ...", mode_label)
+            log.info("Step 6/8 - IBKR order submission [%s] ...", mode_label)
             try:
                 n = ibkr_run(sig_path, dry_run=dry)
                 log.info("IBKR: %d bracket order(s) submitted.", n)
@@ -289,9 +331,9 @@ def main() -> None:
 
     # ── 6. Exit logger (background) ───────────────────────────────────────────
     if args.no_exit_logger:
-        log.info("Step 7/7 - Exit logger skipped (--no-exit-logger).")
+        log.info("Step 7/8 - Exit logger skipped (--no-exit-logger).")
     else:
-        log.info("Step 7/7 - Starting exit logger in background ...")
+        log.info("Step 7/8 - Starting exit logger in background ...")
         try:
             pid_file = Path("logs/exit_logger.pid")
 
