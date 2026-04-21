@@ -664,8 +664,42 @@ def _parse_last_run() -> dict:
         m = re.search(r"Orders placed[: ]+(\d+)", line)
         if m:
             orders_placed = int(m.group(1))
+        # IBKR step
+        if re.search(r"Step \d+/\d+ - IBKR order submission", line):
+            steps["ibkr"] = "ok"
+        if re.search(r"IBKR: \d+ bracket order", line):
+            steps["ibkr"] = "ok"
+        if "IBKR executor failed" in line:
+            steps["ibkr"] = "error"
+        if re.search(r"Step \d+/\d+ - IBKR skipped", line):
+            steps["ibkr"] = "skip"
+        # Exit logger step
+        if "Exit logger launched" in line or "Exit logger already running" in line:
+            steps["exit_logger"] = "ok"
+        if "Failed to launch exit logger" in line:
+            steps["exit_logger"] = "error"
+        if re.search(r"Step \d+/\d+ - Exit logger skipped", line):
+            steps["exit_logger"] = "skip"
         if "Pipeline complete" in line or "Daily run complete" in line:
             complete = True
+
+    # Live check: override exit_logger status if PID file shows it's running now
+    pid_file = Path("logs/exit_logger.pid")
+    if pid_file.exists():
+        try:
+            import ctypes
+            pid = int(pid_file.read_text().strip())
+            handle = ctypes.windll.kernel32.OpenProcess(0x0400, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                steps["exit_logger"] = "ok"   # process is alive right now
+            else:
+                # PID file exists but process is gone — stale file
+                if steps["exit_logger"] is None:
+                    steps["exit_logger"] = "warn"
+        except Exception:
+            pass
+
     return dict(
         run_date=run_date, run_time=run_time, steps=steps,
         screener_count=screener_count,
@@ -2517,9 +2551,22 @@ if last_run:
     icons      = {"ok": "✅", "warn": "⚠️", "error": "❌", "skip": "⏭️", None: "⬜"}
     for col, name, label in zip(step_cols, step_names, step_labels):
         status = last_run.get("steps", {}).get(name)
+        # Exit Logger: show "running" / "stale" sub-label based on live PID check
+        if name == "exit_logger" and status == "ok":
+            sub = "running"
+        elif name == "exit_logger" and status == "warn":
+            sub = "stale PID"
+        elif name == "exit_logger" and status == "skip":
+            sub = "skipped"
+        elif name == "exit_logger" and status == "error":
+            sub = "launch failed"
+        elif name == "exit_logger":
+            sub = "not running"
+        else:
+            sub = status or "not run"
         col.markdown(
             f"{icons.get(status,'⬜')} **{label}**<br/>"
-            f"<span style='color:#888;font-size:11px;'>{status or 'not run'}</span>",
+            f"<span style='color:#888;font-size:11px;'>{sub}</span>",
             unsafe_allow_html=True,
         )
 

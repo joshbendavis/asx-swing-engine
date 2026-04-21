@@ -20,6 +20,11 @@ from datetime import date
 from pathlib import Path
 
 import requests
+from dotenv import load_dotenv
+
+# Load .env so PAPER_BALANCE_OVERRIDE (and Telegram credentials) are available
+# even when this module is invoked standalone rather than via run_daily.py.
+load_dotenv()
 
 log = logging.getLogger("asx-swing")
 
